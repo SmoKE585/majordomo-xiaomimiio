@@ -1111,8 +1111,12 @@ EOD;
         $repo = $this->repo();
         $settings = $this->settings();
         $touched = array();
+        // Бюджет шага: одно «молчащее» устройство ждёт до 10 секунд, а очередь
+        // может быть длинной. Ограничиваем шаг, чтобы heartbeat цикла не отставал.
+        $deadline = microtime(true) + 5.0;
 
         foreach ($repo->dueQueue(50) as $row) {
+            if (microtime(true) >= $deadline) break;
             // Строку забираем до отправки: повторный запуск процесса не отправит её дважды.
             $repo->deleteQueue((int)$row['ID']);
             $device = (int)$row['DEVICE_ID'] > 0 ? $repo->device((int)$row['DEVICE_ID']) : null;
