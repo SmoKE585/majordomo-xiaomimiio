@@ -354,7 +354,12 @@ EOD;
             'noTokenDevices' => $noTokenDevices,
         );
 
-        $this->result = $this->renderTemplate('xiaomimiio.php', $vars);
+        try {
+            $this->result = $this->renderTemplate('xiaomimiio.php', $vars);
+        } catch (Throwable $failure) {
+            DebMes('xiaomimiio: page render failed: ' . $failure->getMessage(), 'xiaomimiio', 'error');
+            $this->result = MDJUI::alert('danger', 'Ошибка страницы модуля', $failure->getMessage());
+        }
     }
 
     private function resolveView(): string
@@ -403,14 +408,19 @@ EOD;
 
     private function renderTemplate(string $template, array $vars): string
     {
-        $file = ROOT . 'templates/xiaomimiio/' . $template;
-        if (!is_file($file)) {
-            return MDJUI::alert('danger', 'Шаблон не найден', 'Ожидался файл ' . $file . '.');
-        }
+        $file = ROOT . 'templates/' . $this->name . '/' . $template;
+        if (!is_file($file)) return MDJUI::alert('danger', 'Шаблон не найден', 'Ожидался файл ' . $file . '.');
         extract($vars, EXTR_SKIP);
+        $level = ob_get_level();
         ob_start();
-        require $file;
-        return (string)ob_get_clean();
+        try {
+            require $file;
+            return (string)ob_get_clean();
+        } catch (Throwable $failure) {
+            // Ошибка в шаблоне не должна оставлять «сырой» HTML без оболочки панели.
+            while (ob_get_level() > $level) ob_end_clean();
+            throw $failure;
+        }
     }
 
     /**
