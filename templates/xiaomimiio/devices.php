@@ -4,6 +4,13 @@ if (!isset($devices, $stats, $url)) {
     http_response_code(404);
     return;
 }
+$listReturn = $url('list');
+$listQuery = http_build_query(array_filter(array(
+    'q' => $search,
+    'sort' => $sort !== 'title' ? $sort : '',
+    'page' => $page > 1 ? $page : '',
+), static fn($value) => $value !== '' && $value !== null));
+if ($listQuery !== '') $listReturn .= '?' . $listQuery;
 $unit = static fn($n, $one, $few, $many) => MDJUI::plural((int)$n, $one, $few, $many);
 ?>
 <div class="md-ui-kpi-grid">
@@ -27,7 +34,7 @@ $unit = static fn($n, $one, $few, $many) => MDJUI::plural((int)$n, $one, $few, $
     ?>
 <?php endif; ?>
 
-<section class="md-table-wrap" aria-label="Устройства Xiaomi miIO">
+<section class="md-table-wrap" aria-label="Устройства Xiaomi miIO" data-md-xiaomi-list>
     <form method="get" action="<?= $e($url('list')) ?>" class="md-table__toolbar">
         <div class="md-table__search">
             <?= MDJUI::icon('search') ?>
@@ -112,7 +119,7 @@ $unit = static fn($n, $one, $few, $many) => MDJUI::plural((int)$n, $one, $few, $
                         <td>
                             <div class="md-table__actions">
                                 <form method="post" class="md-xiaomi-inline-form">
-                                    <?php $hidden(array('operation' => 'refresh_device', 'device_id' => $row['ID'])); ?>
+                                    <?php $hidden(array('operation' => 'refresh_device', 'device_id' => $row['ID'], 'return_url' => $listReturn)); ?>
                                     <?= MDJUI::button('', array('type' => 'submit', 'variant' => 'ghost', 'size' => 'sm', 'icon' => 'refresh', 'attrs' => array('title' => 'Опросить устройство', 'aria-label' => 'Опросить ' . $row['TITLE']))) ?>
                                 </form>
                                 <?= MDJUI::button('', array('href' => $url('', (int)$row['ID']), 'variant' => 'ghost', 'size' => 'sm', 'icon' => 'arrow-right', 'attrs' => array('title' => 'Открыть устройство', 'aria-label' => 'Открыть ' . $row['TITLE']))) ?>

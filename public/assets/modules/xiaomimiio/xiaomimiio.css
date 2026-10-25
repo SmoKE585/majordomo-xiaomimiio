@@ -61,9 +61,21 @@
 .md-xiaomi-help .table > thead > tr > th { border-bottom: 2px solid var(--md-ui-border); }
 .md-xiaomi-help .badge { display: inline-block; padding: 2px 7px; border-radius: 999px; background: var(--md-ui-surface-sunken, rgba(0, 0, 0, .08)); color: inherit; }
 .md-xiaomi-help img { max-width: 100%; height: auto; }
+.md-xiaomi-help .md-table th:first-child, .md-xiaomi-help .md-table td:first-child { white-space: nowrap; }
 .md-xiaomi-help .collapse:not(.show) { display: none; }
 
 @media (max-width: 576px) {
+    /* На телефоне в списке оставляем устройство, статус и действия. */
+    .md-xiaomi-page [data-md-xiaomi-list] .md-table th:nth-child(2),
+    .md-xiaomi-page [data-md-xiaomi-list] .md-table td:nth-child(2),
+    .md-xiaomi-page [data-md-xiaomi-list] .md-table th:nth-child(3),
+    .md-xiaomi-page [data-md-xiaomi-list] .md-table td:nth-child(3),
+    .md-xiaomi-page [data-md-xiaomi-list] .md-table th:nth-child(5),
+    .md-xiaomi-page [data-md-xiaomi-list] .md-table td:nth-child(5),
+    .md-xiaomi-page [data-md-xiaomi-list] .md-table th:nth-child(6),
+    .md-xiaomi-page [data-md-xiaomi-list] .md-table td:nth-child(6) { display: none; }
+    /* Справка: не сжимаем таблицы в нечитаемые колонки, а даём прокрутку. */
+    .md-xiaomi-help .md-table { min-width: 620px; }
     .md-xiaomi-device-head { flex-direction: column; align-items: flex-start; }
     .md-xiaomi-page .md-ui-hero__actions { flex-wrap: wrap; }
     .md-xiaomi-page .md-table__actions { flex-wrap: wrap; }

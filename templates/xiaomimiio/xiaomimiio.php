@@ -87,7 +87,7 @@ if ($view === 'settings') {
             <?php elseif ($isDevice && !$isNew): ?>
                 <?= MDJUI::button('К устройствам', array('href' => $url('list'), 'variant' => 'secondary', 'icon' => 'arrow-left')) ?>
                 <form method="post" class="md-xiaomi-inline-form">
-                    <?php $hidden(array('operation' => 'refresh_device', 'device_id' => $device['ID'])); ?>
+                    <?php $hidden(array('operation' => 'refresh_device', 'device_id' => $device['ID'], 'return_url' => $url('', (int)$device['ID'], $tab === 'bind' ? 'data' : $tab))); ?>
                     <?= MDJUI::button('Опросить', array('type' => 'submit', 'icon' => 'refresh')) ?>
                 </form>
                 <?= MDJUI::button('Настройки', array('href' => $url('settings'), 'variant' => 'ghost', 'icon' => 'settings')) ?>

@@ -413,6 +413,13 @@ EOD;
         return (string)ob_get_clean();
     }
 
+    /**
+     * Справка по модели: старые HTML-фрагменты превращаются в карточки MDJUI.
+     *
+     * В документации 2018 года были Bootstrap-панели с inline-шириной 800px.
+     * Здесь они разбираются DOM-парсером: заголовок панели становится заголовком
+     * карточки, таблицы получают классы md-table, а стили и data-toggle убираются.
+     */
     private function renderHelp(array $device): string
     {
         $model = trim((string)($device['DEVICE_TYPE'] ?? ''));
@@ -427,9 +434,142 @@ EOD;
         $data['DEVICE_TYPE'] = $model;
         $data['ROOTHTML'] = ROOTHTML;
         $parser = new parser($file, $data, $this);
-        return (string)$parser->result;
+        $html = trim((string)$parser->result);
+        if ($html === '') return '';
+        if (!class_exists('DOMDocument')) {
+            return '<div class="md-xiaomi-help">' . $html . '</div>';
+        }
+
+        $sections = $this->helpSections($html);
+        if (!$sections) {
+            $body = $this->cleanHelpHtml($html);
+            return $body === '' ? '' : MDJUI::card(array('title' => 'Справка по модели', 'icon' => 'book'), $body);
+        }
+
+        $out = '';
+        foreach ($sections as $section) {
+            $out .= MDJUI::card(array('title' => $section['title'], 'icon' => 'info-circle'), $section['html']);
+        }
+        return $out;
     }
 
+    private function helpDocument(string $html): \DOMDocument
+    {
+        $document = new \DOMDocument('1.0', 'UTF-8');
+        $previous = libxml_use_internal_errors(true);
+        $document->loadHTML('<?xml encoding="utf-8" ?><div id="md-help-root">' . $html . '</div>', LIBXML_NOERROR | LIBXML_NOWARNING);
+        libxml_clear_errors();
+        libxml_use_internal_errors($previous);
+        return $document;
+    }
+
+    private function helpSections(string $html): array
+    {
+        $document = $this->helpDocument($html);
+        $xpath = new \DOMXPath($document);
+        $root = $xpath->query('//*[@id="md-help-root"]')->item(0);
+        if (!$root) return array();
+
+        $panels = $xpath->query('.//div[contains(concat(" ", normalize-space(@class), " "), " panel ")]', $root);
+        $sections = array();
+        foreach ($panels as $panel) {
+            $titleNode = $xpath->query('.//*[contains(concat(" ", normalize-space(@class), " "), " panel-heading ")]', $panel)->item(0);
+            $bodyNode = $xpath->query('.//*[contains(concat(" ", normalize-space(@class), " "), " panel-body ")]', $panel)->item(0);
+            $title = $titleNode ? trim(preg_replace('/\s+/u', ' ', $titleNode->textContent)) : '';
+            if ($title === '') $title = 'Описание';
+            $body = $bodyNode ? $this->innerHtml($document, $bodyNode) : $this->innerHtml($document, $panel);
+            $body = $this->cleanHelpHtml($body);
+            if (trim(strip_tags($body)) === '' && strpos($body, '<img') === false) continue;
+            $sections[] = array('title' => $title, 'html' => $body);
+        }
+        return $sections;
+    }
+
+    private function innerHtml(\DOMDocument $document, \DOMNode $node): string
+    {
+        $out = '';
+        foreach ($node->childNodes as $child) $out .= $document->saveHTML($child);
+        return $out;
+    }
+
+    private function cleanHelpHtml(string $html): string
+    {
+        $html = trim($html);
+        if ($html === '') return '';
+        $document = $this->helpDocument($html);
+        $xpath = new \DOMXPath($document);
+        $root = $xpath->query('//*[@id="md-help-root"]')->item(0);
+        if (!$root) return '';
+
+        $remove = array('style', 'align', 'border', 'cellpadding', 'cellspacing', 'width', 'height',
+            'nowrap', 'valign', 'data-toggle', 'data-parent', 'data-target', 'onclick', 'onerror');
+        $legacyClasses = array('panel', 'panel-group', 'panel-info', 'panel-default', 'panel-heading',
+            'panel-body', 'collapse', 'in', 'table', 'table-hover', 'table-striped', 'table-bordered',
+            'btn', 'btn-default', 'btn-primary');
+
+        $nodes = array();
+        foreach ($xpath->query('.//*', $root) as $node) $nodes[] = $node;
+        foreach ($nodes as $node) {
+            if (!($node instanceof \DOMElement)) continue;
+            foreach ($remove as $attribute) $node->removeAttribute($attribute);
+            if ($node->hasAttribute('class')) {
+                $classes = preg_split('/\s+/', trim($node->getAttribute('class')));
+                $classes = array_values(array_filter($classes, static function ($class) use ($legacyClasses) {
+                    return $class !== '' && !in_array($class, $legacyClasses, true)
+                        && strpos($class, 'table-') !== 0;
+                }));
+                if ($classes) $node->setAttribute('class', implode(' ', $classes));
+                else $node->removeAttribute('class');
+            }
+        }
+
+        // Старые бейджи Bootstrap → md-badge.
+        foreach ($xpath->query('.//span[contains(concat(" ", normalize-space(@class), " "), " label ")]', $root) as $span) {
+            $original = (string)$span->getAttribute('class');
+            $tone = 'neutral';
+            foreach (array('success', 'warning', 'danger', 'info') as $candidate) {
+                if (strpos($original, 'label-' . $candidate) !== false) $tone = $candidate;
+            }
+            $span->setAttribute('class', 'md-badge md-badge--' . $tone);
+        }
+
+        // Нормализуем thead, где th лежат без tr (так писали в старых справках).
+        $theads = array();
+        foreach ($xpath->query('.//thead', $root) as $thead) $theads[] = $thead;
+        foreach ($theads as $thead) {
+            $th = array();
+            foreach ($thead->childNodes as $child) {
+                if ($child instanceof \DOMElement && strtolower($child->tagName) === 'th') $th[] = $child;
+            }
+            if ($th) {
+                $tr = $document->createElement('tr');
+                $thead->appendChild($tr);
+                foreach ($th as $cell) $tr->appendChild($cell);
+            }
+        }
+
+        // Таблицы: класс md-table и обёртка для горизонтальной прокрутки.
+        $tables = array();
+        foreach ($xpath->query('.//table', $root) as $table) $tables[] = $table;
+        foreach ($tables as $table) {
+            $table->setAttribute('class', 'md-table');
+            $parent = $table->parentNode;
+            if ($parent && !($parent instanceof \DOMElement && strpos((string)$parent->getAttribute('class'), 'md-table__scroll') !== false)) {
+                $wrap = $document->createElement('div');
+                $wrap->setAttribute('class', 'md-table__scroll');
+                $parent->insertBefore($wrap, $table);
+                $wrap->appendChild($table);
+            }
+        }
+
+        foreach ($xpath->query('.//img', $root) as $image) {
+            $image->setAttribute('loading', 'lazy');
+            $image->setAttribute('decoding', 'async');
+            $image->setAttribute('class', trim((string)$image->getAttribute('class') . ' md-xiaomi-help__image'));
+        }
+
+        return trim($this->innerHtml($document, $root));
+    }
     private function renderLinkedObject(array $binding): string
     {
         if (!class_exists('linkedobject', false)) {
@@ -580,8 +720,16 @@ EOD;
         return array(
             'title' => 'Запрос отправлен',
             'text' => 'Команды miIO.info и опроса состояния стоят в очереди. Ответ появится в свойствах устройства.',
-            'url' => $this->deviceUrl($id),
+            'url' => $this->returnUrl($this->deviceUrl($id)),
         );
+    }
+
+    /** Возврат на страницу, с которой нажали «Опросить», если это наш модуль. */
+    private function returnUrl(string $fallback): string
+    {
+        $value = $this->posted('return_url');
+        if ($value === '' || preg_match('/[\r\n]/', $value)) return $fallback;
+        return str_starts_with($value, ROOTHTML . 'panel/xiaomimiio') ? $value : $fallback;
     }
 
     private function clearQueue(): array

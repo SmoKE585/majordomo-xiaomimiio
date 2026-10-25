@@ -224,7 +224,10 @@ endif;
                 <input type="search" data-md-table-search placeholder="Свойство, ключ или привязка" aria-label="Поиск свойств" autocomplete="off">
             </div>
             <span class="md-table__meta" data-md-table-meta>Свойств: <?= count($properties) ?></span>
-            <?= MDJUI::button('Обновить', array('href' => $url('', $id, $tab === 'data' ? 'data' : 'gwradio'), 'variant' => 'ghost', 'size' => 'sm', 'icon' => 'refresh')) ?>
+            <form method="post" class="md-xiaomi-inline-form">
+                <?php $hidden(array('operation' => 'refresh_device', 'device_id' => $device['ID'], 'return_url' => $url('', $id, $tab === 'data' ? 'data' : 'gwradio'))); ?>
+                <?= MDJUI::button('Обновить', array('type' => 'submit', 'variant' => 'ghost', 'size' => 'sm', 'icon' => 'refresh')) ?>
+            </form>
         </div>
         <?php if (!$properties): ?>
             <?= MDJUI::emptyState(array(
@@ -358,7 +361,7 @@ endif;
     </div>
 
 <?php elseif ($tab === 'help'): ?>
-    <?= MDJUI::alert('info', 'Справка по модели', 'Ниже — описание метрик и команд из прежней документации модуля. Текст сохранён как есть: он проверен на реальных устройствах.') ?>
+    <?= MDJUI::alert('info', 'Справка по модели', 'Описание метрик и команд для этой модели. Значения и подписи приведены к тем, что используются в карточке устройства.') ?>
     <div class="md-xiaomi-help">
         <?= $helpHtml ?>
     </div>
