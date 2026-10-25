@@ -1651,11 +1651,21 @@ array('did'=>'water_box_carriage_status','siid'=>4,'piid'=>6),
 
         $res_commands = array();
 
+        $device = array();
         if ($device_id) {
             $device = SQLSelectOne("SELECT * FROM miio_devices WHERE ID=" . (int)$device_id);
         }
 
         $data = json_decode($message, true);
+        if (!is_array($data)) {
+            // Битая посылка не должна выглядеть как успешный ответ и включать online.
+            if (!empty($device['ID'])) {
+                $this->processCommand($device['ID'], 'online', 0);
+                $this->processCommand($device['ID'], 'message', (string)$message);
+            }
+            DebMes('xiaomimiio: invalid JSON from device ' . (int)$device_id, 'xiaomimiio', 'warning');
+            return;
+        }
 
         if (isset($data['error']) && $data['error'] == 'Device not answered') {
             if ($device['ID']) {

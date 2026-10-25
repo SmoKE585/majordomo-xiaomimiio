@@ -66,8 +66,10 @@ class miIO {
 
 	public function __destruct() {
 
-		@socket_shutdown($this->sock, 2);
-		@socket_close($this->sock);
+		if ($this->sock) {
+			@socket_shutdown($this->sock, 2);
+			@socket_close($this->sock);
+		}
 
 	}
 
@@ -77,11 +79,13 @@ class miIO {
 
 	public function sockCreate() {
 
-		if (!($this->sock = socket_create(AF_INET, SOCK_DGRAM, SOL_UDP))) {
+		if (!($this->sock = @socket_create(AF_INET, SOCK_DGRAM, SOL_UDP))) {
 			$errorcode = socket_last_error();
 			$errormsg = socket_strerror($errorcode);
 			if ($this->debug) echo "Error socket create - [socket_create()] [$errorcode] $errormsg" . PHP_EOL;
-			die("Error socket create - [socket_create()] [$errorcode] $errormsg \n");
+			// Раньше здесь был die(): одна ошибка сокета убивала всю страницу
+			// или цикл. Вызывающий код умеет обработать исключение.
+			throw new RuntimeException("Error socket create - [socket_create()] [$errorcode] $errormsg");
 		} else { if ($this->debug) echo 'Socked created' . PHP_EOL; }
 
 	}
