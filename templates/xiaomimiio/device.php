@@ -135,7 +135,7 @@ endif;
         <?php }, array('icon' => 'settings')); ?>
     </div>
 
-    <?php $card('Диагностика', static function () use ($device, $hidden, $url, $model, $queue, $lanKey, $e): void { ?>
+    <?php $card('Диагностика', static function () use ($device, $hidden, $url, $model, $queue, $lanKey, $e, $tab): void { ?>
         <div class="md-xiaomi-tools">
             <form method="post" class="md-ui-form-stack">
                 <?php $hidden(array('operation' => 'device_info', 'device_id' => $device['ID'])); ?>
