@@ -261,12 +261,35 @@
         });
     };
 
+    const toast = (type, title, text) => {
+        if (window.MDJUIToast) window.MDJUIToast.show({type, title, text});
+    };
+
+    const initRefresh = page => {
+        page.addEventListener('submit', async event => {
+            const form = event.target.closest('form[data-md-refresh-device]');
+            if (!form) return;
+            event.preventDefault();
+            const button = form.querySelector('button[type="submit"]');
+            if (button) button.disabled = true;
+            try {
+                const payload = await post(page, 'refresh', {device_id: form.dataset.mdRefreshDevice});
+                const message = payload.data && payload.data.message ? payload.data.message : 'Команда поставлена в очередь.';
+                toast('success', 'Запрос отправлен', message);
+            } catch (error) {
+                toast('danger', 'Не удалось обновить', error.message);
+            } finally {
+                if (button) button.disabled = false;
+            }
+        });
+    };
     const init = (root = document) => {
         root.querySelectorAll('[data-md-xiaomi]').forEach(page => {
             if (page.dataset.mdXiaomiReady) return;
             page.dataset.mdXiaomiReady = '1';
             initImages(page);
             initHelp(page);
+            initRefresh(page);
             initLan(page);
             initIr(page);
             initZigbee(page);

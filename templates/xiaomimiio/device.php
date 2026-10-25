@@ -224,7 +224,7 @@ endif;
                 <input type="search" data-md-table-search placeholder="Свойство, ключ или привязка" aria-label="Поиск свойств" autocomplete="off">
             </div>
             <span class="md-table__meta" data-md-table-meta>Свойств: <?= count($properties) ?></span>
-            <form method="post" class="md-xiaomi-inline-form">
+            <form method="post" action="<?= $e($url('', $id, $tab === 'data' ? 'data' : 'gwradio')) ?>" class="md-xiaomi-inline-form" data-md-refresh-device="<?= (int)$device['ID'] ?>">
                 <?php $hidden(array('operation' => 'refresh_device', 'device_id' => $device['ID'], 'return_url' => $url('', $id, $tab === 'data' ? 'data' : 'gwradio'))); ?>
                 <?= MDJUI::button('Обновить', array('type' => 'submit', 'variant' => 'ghost', 'size' => 'sm', 'icon' => 'refresh')) ?>
             </form>

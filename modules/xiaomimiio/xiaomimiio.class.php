@@ -1175,8 +1175,14 @@ EOD;
                     $this->ajaxResult($this->executeDirect($device, 'remove_device', '["' . addcslashes($sid, '"\\') . '"]'));
                     return;
                 case 'refresh':
+                    if (!$device) throw new InvalidArgumentException('Устройство не найдено.');
+                    if (trim((string)$device['TOKEN']) === '') throw new InvalidArgumentException('Сначала укажите токен устройства.');
+                    $this->requestInfo((int)$device['ID']);
                     $this->requestStatus((int)$device['ID']);
-                    $this->json(array('ok' => true, 'data' => 'queued'));
+                    $this->repo()->markPoll((int)$device['ID'], date('Y-m-d H:i:s'), 0);
+                    $this->json(array('ok' => true, 'data' => array(
+                        'message' => 'Запрос отправлен. Ответ устройства появится в свойствах через несколько секунд.',
+                    )));
                     return;
             }
             throw new InvalidArgumentException('Неизвестная операция.');

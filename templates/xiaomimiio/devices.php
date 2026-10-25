@@ -118,7 +118,7 @@ $unit = static fn($n, $one, $few, $many) => MDJUI::plural((int)$n, $one, $few, $
                         <td><span class="md-table__signal"><?= $e($row['LAST_SEEN'] ?: ($row['LAST_REPLY'] ?: '—')) ?></span></td>
                         <td>
                             <div class="md-table__actions">
-                                <form method="post" class="md-xiaomi-inline-form">
+                                <form method="post" action="<?= $e($listReturn) ?>" class="md-xiaomi-inline-form" data-md-refresh-device="<?= (int)$row['ID'] ?>">
                                     <?php $hidden(array('operation' => 'refresh_device', 'device_id' => $row['ID'], 'return_url' => $listReturn)); ?>
                                     <?= MDJUI::button('', array('type' => 'submit', 'variant' => 'ghost', 'size' => 'sm', 'icon' => 'refresh', 'attrs' => array('title' => 'Опросить устройство', 'aria-label' => 'Опросить ' . $row['TITLE']))) ?>
                                 </form>
