@@ -1,0 +1,2482 @@
+<?php
+/**
+ * Движок miIO: обнаружение, опрос, очередь команд и разбор ответов.
+ *
+ * Логика вынесена из класса модуля в trait без изменения поведения: это тот же
+ * код устройств, который годами проверялся на реальном оборудовании. Новый
+ * интерфейс и цикл обращаются к нему через методы модуля.
+ *
+ * 2026-10-25 — код вынесен в trait, define() заменены на XiaomiMiioConst.
+ */
+trait XiaomiMiioEngine
+{
+    /**
+     * addToQueue
+     *
+     * Добавление команды в очередь
+     *
+     * @access private
+     */
+
+    function addToQueue($device_id, $method, $data = '[]', $timeshift = 0)
+    {
+
+        $rec = array();
+        $rec['DEVICE_ID'] = (int)$device_id;
+        $rec['METHOD'] = $method;
+        $rec['DATA'] = $data;
+        if ($timeshift > 0) {
+            $rec['ADDED'] = date('Y-m-d H:i:s', time() + $timeshift);
+        } else {
+            $rec['ADDED'] = date('Y-m-d H:i:s');
+        }
+
+        if (!empty($this->config['API_LOG_DEBMES'])) DebMes("Outgoing message to $device_id ($method): $data", 'xiaomimiio');
+
+        SQLInsert('miio_queue', $rec);
+
+    }
+
+    /**
+     * discover
+     *
+     * Поиск miIO-устройств в локальной сети
+     *
+     * @access public
+     */
+
+    function discover($ip = '')
+    {
+
+        $this->getConfig();
+
+        $bind_ip = !empty($this->config['API_IP']) ? $this->config['API_IP'] : '0.0.0.0';
+        $miio_debug = !empty($this->config['API_LOG_MIIO']);
+
+        if (!class_exists('miIO', false)) {
+            include_once(DIR_MODULES . 'xiaomimiio/lib/miio.class.php');
+        }
+
+        $midev = new miIO(null, $bind_ip, null, $miio_debug);
+
+        // Выполняем broadcast-поиск устройств в локальной сети
+        if (!empty($this->config['API_LOG_DEBMES'])) DebMes("Run miIO-discover command", 'xiaomimiio');
+        $res = $midev->discover();
+        if (!empty($this->config['API_LOG_DEBMES'])) DebMes("End miIO-discover command", 'xiaomimiio');
+
+        if ($res) {
+            // Обрабатываем результат поиска
+            $reply = $midev->data;
+
+            if ($reply != '') {
+                if (!empty($this->config['API_LOG_DEBMES'])) DebMes("Reply = $reply", 'xiaomimiio');
+
+                $all_devices = SQLSelect('SELECT * FROM miio_devices');
+                $count_devices = count($all_devices);
+                if (!empty($this->config['API_LOG_DEBMES'])) DebMes("Current count of devices $count_devices", 'xiaomimiio');
+                $found_devices = json_decode($reply, true);
+
+                if (is_array($found_devices['devices'])) {
+                    foreach ($found_devices['devices'] as $dev) {
+                        $dev = json_decode($dev, true);
+                        $ip = $dev['ip'];
+                        $device_type_code = $dev['devicetype'];
+                        $device_serial = $dev['serial'];
+                        $token = $dev['token'];
+
+                        if (preg_match('/^[0fF]+$/', $token)) $token = '';
+
+                        if (preg_match('/^[0fF]+$/', $device_type_code) || preg_match('/^[0fF]+$/', $device_serial)) {
+                            if (!empty($this->config['API_LOG_DEBMES'])) DebMes("Device $ip has wrong type code $device_type_code and serial number $device_serial", 'xiaomimiio');
+                            continue;
+                        }
+
+                        //TODO: новые сравниваются по sid и devcode, но если устройство было добавлено вручную, то эти параметры будут отсутствовать,
+                        //соотвественно устройство добавится как новое, а не перезапишет (обновит) добавленно вручную.
+                        $dev_rec = SQLSelectOne("SELECT * FROM miio_devices WHERE DEVICE_TYPE_CODE='$device_type_code' AND SERIAL='$device_serial'");
+
+                        if (isset($dev_rec['ID'])) {
+                            // Если устройство уже есть в БД, то обновим его IP, токен и свойство online
+                            $dev_rec['IP'] = $ip;
+                            if ($token != '') $dev_rec['TOKEN'] = $token;
+
+                            if (!empty($this->config['API_LOG_DEBMES'])) DebMes("Update the ip address and the token for the device $ip", 'xiaomimiio');
+                            SQLUpdate('miio_devices', $dev_rec);
+
+                            // Ответившее устройство выкинем из претендентов на оффлайн
+                            for ($i = 0; $i < $count_devices; $i++) {
+                                if (isset($all_devices[$i]['ID']) && $dev_rec['ID'] == $all_devices[$i]['ID']) {
+                                    unset($all_devices[$i]);
+                                    break;
+                                }
+                            }
+
+                            $this->processCommand($dev_rec['ID'], 'online', 1);
+                        } else {
+                            // Если устройство нет в БД, то добавим его
+                            $dev_rec = array();
+                            $dev_rec['IP'] = $ip;
+                            if ($token != '') $dev_rec['TOKEN'] = $token;
+
+                            $dev_rec['SERIAL'] = $device_serial;
+                            $dev_rec['DEVICE_TYPE_CODE'] = $device_type_code;
+                            $dev_rec['TITLE'] = 'New ' . $dev_rec['DEVICE_TYPE_CODE'];
+                            if (!empty($this->config['API_LOG_DEBMES'])) DebMes("Add new device with $ip", 'xiaomimiio');
+
+                            // Если есть токен, то пробуем получить тип устройства из miIO.info
+                            if ($dev_rec['TOKEN']) {
+                                if (!empty($this->config['API_LOG_DEBMES'])) DebMes('Try to get device model from miIO.info for the device ' . $dev_rec['IP'], 'xiaomimiio');
+                                $midev->data = '';
+                                $midev->ip = $dev_rec['IP'];
+                                $midev->token = $dev_rec['TOKEN'];
+                                if ($midev->getInfo(time())) {
+                                    if ($midev->data != '') {
+                                        $info = json_decode($midev->data, true);
+                                        $dev_type = $info['result']['model'];
+                                        if (!empty($this->config['API_LOG_DEBMES'])) DebMes($dev_rec['IP'] . ' is ' . $dev_type, 'xiaomimiio');
+                                        if ($dev_type != '') $dev_rec['DEVICE_TYPE'] = $dev_type;
+                                    }
+                                }
+                            }
+
+                            $dev_rec['ID'] = SQLInsert('miio_devices', $dev_rec);
+
+                            // Базовые метрики устройств
+                            $this->processCommand($dev_rec['ID'], 'online', 1);
+                            $this->processCommand($dev_rec['ID'], 'command', '');
+                            $this->processCommand($dev_rec['ID'], 'message', '');
+
+                            // Специфичные метрики для некоторых устройств
+                            if ($dev_rec['DEVICE_TYPE'] != '') {
+                                $this->requestStatus($dev_rec['ID']);
+                                if ($dev_rec['DEVICE_TYPE'] == 'lumi.gateway.v3') {
+                                    $this->processCommand($dev_rec['ID'], 'add_program', '');
+                                    $this->processCommand($dev_rec['ID'], 'del_program', '');
+                                } else if ($dev_rec['DEVICE_TYPE'] == 'lumi.acpartner.v3') {
+                                    $this->processCommand($dev_rec['ID'], 'add_program', '');
+                                    $this->processCommand($dev_rec['ID'], 'del_program', '');
+                                    $this->processCommand($dev_rec['ID'], 'ir_play', '');
+                                    $this->processCommand($dev_rec['ID'], 'power', '');
+                                    $this->processCommand($dev_rec['ID'], 'load_power', '');
+                                } else if ($dev_rec['DEVICE_TYPE'] == 'chuangmi.ir.v2') {
+                                    $this->processCommand($dev_rec['ID'], 'ir_play', '');
+                                } else if ($dev_rec['DEVICE_TYPE'] == 'xiaomi.wifispeaker.v1') {
+                                    $this->processCommand($dev_rec['ID'], 'vol_up', '');
+                                    $this->processCommand($dev_rec['ID'], 'vol_down', '');
+                                } else if ($dev_rec['DEVICE_TYPE'] == 'rockrobo.vacuum.v1' || $dev_rec['DEVICE_TYPE'] == 'roborock.vacuum.s5' || $dev_rec['DEVICE_TYPE'] == 'roborock.vacuum.m1s') {
+                                    $this->processCommand($dev_rec['ID'], 'goto_target', '');
+                                    $this->processCommand($dev_rec['ID'], 'zoned_clean', '');
+                                    if ($dev_rec['DEVICE_TYPE'] == 'roborock.vacuum.s5' || $dev_rec['DEVICE_TYPE'] == 'roborock.vacuum.m1s') {
+                                        $this->processCommand($dev_rec['ID'], 'segment_clean', '');
+                                    }
+                                } else if ($dev_rec['DEVICE_TYPE'] == 'hfjh.fishbowl.v1') {
+                                    $this->processCommand($dev_rec['ID'], 'auto_feed', '');
+                                    $this->processCommand($dev_rec['ID'], 'single_feed', '');
+                                } else if ($dev_rec['DEVICE_TYPE'] == '090615.switch.xswitch03') {
+                                    $this->processCommand($dev_rec['ID'], 'switch_all', '');
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Статус доступности определяет опрос и ответы на команды, а не
+                // широковещательный поиск: иначе устройства из другой подсети
+                // становились бы офлайн каждые две минуты.
+            }
+        } else {
+            if (!empty($this->config['API_LOG_DEBMES'])) DebMes('Not received any response from devices', 'xiaomimiio');
+        }
+
+    }
+
+    /**
+     * requestInfo
+     *
+     * Запрос сведений miIO.info
+     *
+     * @access public
+     */
+
+    function requestInfo($device_id)
+    {
+
+        $this->addToQueue($device_id, 'miIO.info');
+
+    }
+    /**
+     * requestStatus
+     *
+     * Запрос статусов устройств
+     *
+     * @access public
+     */
+
+    function requestStatus($device_id)
+    {
+
+        $device_rec = SQLSelectOne("SELECT * FROM miio_devices WHERE ID=" . (int)$device_id);
+        $this->processCommand($device_rec['ID'], 'command', '');
+
+        if (($device_rec['DEVICE_TYPE'] == 'philips.light.bulb') || ($device_rec['DEVICE_TYPE'] == 'philips.light.downlight')) {
+            //
+            $props = explode(',', XiaomiMiioConst::MIIO_PHILIPS_LIGHT_BULB_PROPS);
+            $total = count($props);
+            for ($i = 0; $i < $total; $i++) {
+                $props[$i] = '"' . $props[$i] . '"';
+            }
+            $this->addToQueue($device_id, 'get_prop', '[' . implode(',', $props) . ']');
+        } elseif ($device_rec['DEVICE_TYPE'] == 'philips.light.candle') {
+            //
+            $props = explode(',', XiaomiMiioConst::MIIO_PHILIPS_LIGHT_CANDLE_PROPS);
+            $total = count($props);
+            for ($i = 0; $i < $total; $i++) {
+                $props[$i] = '"' . $props[$i] . '"';
+            }
+            $this->addToQueue($device_id, 'get_prop', '[' . implode(',', $props) . ']');
+        } elseif ($device_rec['DEVICE_TYPE'] == 'philips.light.sread1') {
+            //
+            $props = explode(',', XiaomiMiioConst::MIIO_PHILIPS_EYECARE_LAMP_2_PROPS);
+            $total = count($props);
+            for ($i = 0; $i < $total; $i++) {
+                $props[$i] = '"' . $props[$i] . '"';
+            }
+            $this->addToQueue($device_id, 'get_prop', '[' . implode(',', $props) . ']');
+        } elseif ($device_rec['DEVICE_TYPE'] == 'yeelink.light.mono1') {
+            //
+            $props = explode(',', XiaomiMiioConst::MIIO_YEELIGHT_WHITE_BULB_PROPS);
+            $total = count($props);
+            for ($i = 0; $i < $total; $i++) {
+                $props[$i] = '"' . $props[$i] . '"';
+            }
+            $this->addToQueue($device_id, 'get_prop', '[' . implode(',', $props) . ']');
+        } elseif ($device_rec['DEVICE_TYPE'] == 'yeelink.light.color1') {
+            //
+            $props = explode(',', XiaomiMiioConst::MIIO_YEELIGHT_COLOR_BULB_PROPS);
+            $total = count($props);
+            for ($i = 0; $i < $total; $i++) {
+                $props[$i] = '"' . $props[$i] . '"';
+            }
+            $this->addToQueue($device_id, 'get_prop', '[' . implode(',', $props) . ']');
+        } else if (($device_rec['DEVICE_TYPE'] == 'rockrobo.vacuum.v1') || ($device_rec['DEVICE_TYPE'] == 'roborock.vacuum.s5') || ($device_rec['DEVICE_TYPE'] == 'roborock.vacuum.m1s')) {
+            //
+            $this->addToQueue($device_id, 'get_status');
+            $this->addToQueue($device_id, 'get_consumable');
+            $this->addToQueue($device_id, 'get_custom_mode');
+        } elseif ($device_rec['DEVICE_TYPE'] == 'chuangmi.plug.m1') {
+            //
+            $props = explode(',', XiaomiMiioConst::MIIO_CHUANGMI_PLUG_M1_PROPS);
+            $total = count($props);
+            for ($i = 0; $i < $total; $i++) {
+                $props[$i] = '"' . $props[$i] . '"';
+            }
+            $this->addToQueue($device_id, 'get_prop', '[' . implode(',', $props) . ']');
+        } elseif (($device_rec['DEVICE_TYPE'] == 'chuangmi.plug.v1') || ($device_rec['DEVICE_TYPE'] == 'chuangmi.plug.v3')) {
+            //
+            $props = explode(',', XiaomiMiioConst::MIIO_CHUANGMI_PLUG_V1_PROPS);
+            $total = count($props);
+            for ($i = 0; $i < $total; $i++) {
+                $props[$i] = '"' . $props[$i] . '"';
+            }
+            $this->addToQueue($device_id, 'get_prop', '[' . implode(',', $props) . ']');
+            if ($device_rec['DEVICE_TYPE'] == 'chuangmi.plug.v3') {
+                $this->addToQueue($device_id, 'get_power');
+            }
+        } elseif (($device_rec['DEVICE_TYPE'] == 'lumi.gateway.v3') || ($device_rec['DEVICE_TYPE'] == 'lumi.acpartner.v3')) {
+            //
+            if ($device_rec['DEVICE_TYPE'] == 'lumi.acpartner.v3') {
+                $this->addToQueue($device_id, 'get_device_prop', '["lumi.0","plug_state","ac_power"]');
+            }
+            $this->addToQueue($device_id, 'get_arming', '[]');
+            $this->addToQueue($device_id, 'get_prop_fm', '[]');
+            if ($this->view_mode == 'propupd_miio_devices') {
+                $this->addToQueue($device_id, 'get_lumi_dpf_aes_key', '[]');
+                $this->addToQueue($device_id, 'get_zigbee_channel', '[]');
+            }
+            $this->addToQueue($device_id, 'get_channels', '{"start":0}', 4);
+            //TODO: $this->addToQueue($device_id, 'get_channels', '{"start":10}');
+            //      Если станций больше 10, 20.
+        } elseif ($device_rec['DEVICE_TYPE'] == 'philips.light.ceiling') {
+            //
+            $props = explode(',', XiaomiMiioConst::MIIO_PHILIPS_LIGHT_CEILING_PROPS);
+            $total = count($props);
+            for ($i = 0; $i < $total; $i++) {
+                $props[$i] = '"' . $props[$i] . '"';
+            }
+            $this->addToQueue($device_id, 'get_prop', '[' . implode(',', $props) . ']');
+        } elseif (($device_rec['DEVICE_TYPE'] == 'yeelink.light.ceiling1') || ($device_rec['DEVICE_TYPE'] == 'yeelink.light.ceiling8') || ($device_rec['DEVICE_TYPE'] == 'yeelink.light.ceiling3')) {
+            //
+            $props = explode(',', XiaomiMiioConst::MIIO_YEELIGHT_CEILING_LIGHT_PROPS);
+            $total = count($props);
+            for ($i = 0; $i < $total; $i++) {
+                $props[$i] = '"' . $props[$i] . '"';
+            }
+            $this->addToQueue($device_id, 'get_prop', '[' . implode(',', $props) . ']');
+        } elseif ($device_rec['DEVICE_TYPE'] == 'yeelink.light.ceiling4') {
+            //
+            $props = explode(',', XiaomiMiioConst::MIIO_YEELIGHT_CEILING_LIGHT_650_PROPS);
+            $total = count($props);
+            for ($i = 0; $i < $total; $i++) {
+                $props[$i] = '"' . $props[$i] . '"';
+            }
+            $this->addToQueue($device_id, 'get_prop', '[' . implode(',', $props) . ']');
+        } elseif ($device_rec['DEVICE_TYPE'] == 'yeelink.light.lamp1' ||
+            $device_rec['DEVICE_TYPE'] == 'yeelink.light.lamp2' ||
+            $device_rec['DEVICE_TYPE'] == 'yeelink.light.lamp4') {
+            //
+            $props = explode(',', XiaomiMiioConst::MIIO_YEELIGHT_LAMP_LIGHT_PROPS);
+            $total = count($props);
+            for ($i = 0; $i < $total; $i++) {
+                $props[$i] = '"' . $props[$i] . '"';
+            }
+            $this->addToQueue($device_id, 'get_prop', '[' . implode(',', $props) . ']');
+        } elseif ($device_rec['DEVICE_TYPE'] == 'yeelink.light.strip1') {
+            //
+            $props = explode(',', XiaomiMiioConst::MIIO_YEELIGHT_STRIP_PROPS);
+            $total = count($props);
+            for ($i = 0; $i < $total; $i++) {
+                $props[$i] = '"' . $props[$i] . '"';
+            }
+            $this->addToQueue($device_id, 'get_prop', '[' . implode(',', $props) . ']');
+        } elseif ($device_rec['DEVICE_TYPE'] == 'zimi.powerstrip.v2') {
+            //
+            $props = explode(',', XiaomiMiioConst::MIIO_ZIMI_POWERSTRIP_2_PROPS);
+            $total = count($props);
+            for ($i = 0; $i < $total; $i++) {
+                $props[$i] = '"' . $props[$i] . '"';
+            }
+            $this->addToQueue($device_id, 'get_prop', '[' . implode(',', $props) . ']');
+        } elseif ($device_rec['DEVICE_TYPE'] == 'qmi.powerstrip.v1') {
+            //
+            $props = explode(',', XiaomiMiioConst::MIIO_QMI_POWERSTRIP_1_PROPS);
+            $total = count($props);
+            for ($i = 0; $i < $total; $i++) {
+                $props[$i] = '"' . $props[$i] . '"';
+            }
+            $this->addToQueue($device_id, 'get_prop', '[' . implode(',', $props) . ']');
+        } elseif ($device_rec['DEVICE_TYPE'] == 'zhimi.humidifier.v1') {
+            //
+            $props = explode(',', XiaomiMiioConst::MIIO_ZHIMI_HUMIDIFIER_PROPS);
+            $total = count($props);
+            for ($i = 0; $i < $total; $i++) {
+                $props[$i] = '"' . $props[$i] . '"';
+            }
+            $this->addToQueue($device_id, 'get_prop', '[' . implode(',', $props) . ']');
+        } elseif ($device_rec['DEVICE_TYPE'] == 'zhimi.humidifier.ca1') {
+            //
+            $props = explode(',', XiaomiMiioConst::MIIO_ZHIMI_HUMIDIFIER_2_PROPS);
+            $total = count($props);
+            for ($i = 0; $i < $total; $i++) {
+                $props[$i] = '"' . $props[$i] . '"';
+            }
+            $this->addToQueue($device_id, 'get_prop', '[' . implode(',', $props) . ']');
+            
+        } elseif ($device_rec['DEVICE_TYPE'] == 'zhimi.humidifier.ca4') {
+            $this->addToQueue($device_id, 'get_properties', '[{"did":"power","siid":2,"piid":1,"value":0},{"did":"mode","siid":2,"piid":5,"value":0},{"did":"temperature","siid":3,"piid":7,"value":0},{"did":"water_level","siid":2,"piid":7,"value":0},{"did":"humidity","siid":3,"piid":9,"value":0},{"did":"speed_level","siid":7,"piid":1,"value":0},{"did":"led_brightness","siid":5,"piid":2,"value":0}]');
+            $this->addToQueue($device_id, 'get_properties', '[{"did":"fault","siid":2,"piid":2,"value":0},{"did":"target_humidity","siid":2,"piid":6,"value":0},{"did":"dry","siid":2,"piid":8,"value":0},{"did":"use_time","siid":2,"piid":9,"value":0},{"did":"button_pressed","siid":2,"piid":10,"value":0},{"did":"fahrenheit","siid":3,"piid":8,"value":0},{"did":"buzzer","siid":4,"piid":1,"value":0},{"did":"child_lock","siid":6,"piid":1,"value":0},{"did":"actual_speed","siid":7,"piid":1,"value":0},{"did":"power_time","siid":7,"piid":3,"value":0},{"did":"clean_mode","siid":7,"piid":5,"value":0}]');
+           
+        } elseif ($device_rec['DEVICE_TYPE'] == 'deerma.humidifier.jsq5') {
+            $this->addToQueue($device_id, 'get_properties', '[{"did":"power","siid":2,"piid":1,"value":0},{"did":"relative_humidity","siid":3,"piid":1,"value":0},{"did":"temperature","siid":3,"piid":7,"value":0},{"did":"target_humidity","siid":2,"piid":6,"value":0},{"did":"fan_level","siid":2,"piid":5,"value":0},{"did":"fault","siid":2,"piid":2,"value":0},{"did":"led","siid":6,"piid":1,"value":0},{"did":"water_shortage_fault","siid":7,"piid":1,"value":0},{"did":"the_tank_filedt","siid":7,"piid":2,"value":0},{"did":"buzzer","siid":5,"piid":1,"value":0}]');
+         	
+		} elseif ($device_rec['DEVICE_TYPE'] == 'deerma.humidifier.jsq2g') {
+            $this->addToQueue($device_id, 'get_properties', '[{"did":"power","siid":2,"piid":1,"value":0},{"did":"relative_humidity","siid":3,"piid":1,"value":0},{"did":"temperature","siid":3,"piid":7,"value":0},{"did":"target_humidity","siid":2,"piid":6,"value":0},{"did":"fan_level","siid":2,"piid":5,"value":0},{"did":"fault","siid":2,"piid":2,"value":0},{"did":"led","siid":6,"piid":1,"value":0},{"did":"water_shortage_fault","siid":7,"piid":2,"value":0},{"did":"the_tank_filed","siid":7,"piid":1,"value":0},{"did":"buzzer","siid":5,"piid":1,"value":0}]');
+         	
+		} elseif ($device_rec['DEVICE_TYPE'] == 'zhimi.airpurifier.ma2') {
+            //
+            $props = explode(',', XiaomiMiioConst::MIIO_ZHIMI_AIRPURIFIER_MA2_PROPS);
+            $total = count($props);
+            for ($i = 0; $i < $total; $i++) {
+                $props[$i] = '"' . $props[$i] . '"';
+            }
+            $this->addToQueue($device_id, 'get_prop', '[' . implode(',', $props) . ']');
+        } elseif ($device_rec['DEVICE_TYPE'] == 'zhimi.airpurifier.v3') {
+            //
+            $props = explode(',', XiaomiMiioConst::MIIO_ZHIMI_AIRPURIFIER_V3_PROPS);
+            $total = count($props);
+            for ($i = 0; $i < $total; $i++) {
+                $props[$i] = '"' . $props[$i] . '"';
+            }
+            $this->addToQueue($device_id, 'get_prop', '[' . implode(',', $props) . ']');
+        } elseif ($device_rec['DEVICE_TYPE'] == 'yeelink.light.bslamp1') {
+            //
+            $props = explode(',', XiaomiMiioConst::MIIO_YEELIGHT_BSLAMP1_PROPS);
+            $total = count($props);
+            for ($i = 0; $i < $total; $i++) {
+                $props[$i] = '"' . $props[$i] . '"';
+            }
+            $this->addToQueue($device_id, 'get_prop', '[' . implode(',', $props) . ']');
+        } elseif ($device_rec['DEVICE_TYPE'] == 'xiaomi.wifispeaker.v1') {
+            //
+            $props = explode(',', XiaomiMiioConst::MIIO_MIWIFISPEAKER_V1_PROPS);
+            $total = count($props);
+            for ($i = 0; $i < $total; $i++) {
+                $props[$i] = '"' . $props[$i] . '"';
+            }
+            $this->addToQueue($device_id, 'get_prop', '[' . implode(',', $props) . ']');
+        } elseif ($device_rec['DEVICE_TYPE'] == 'zhimi.fan.sa1') {
+            //
+            $props = explode(',', XiaomiMiioConst::MIIO_ZHIMI_FAN_SA1_PROPS);
+            $total = count($props);
+            for ($i = 0; $i < $total; $i++) {
+                $props[$i] = '"' . $props[$i] . '"';
+            }
+            $this->addToQueue($device_id, 'get_prop', '[' . implode(',', $props) . ']');
+        } elseif ($device_rec['DEVICE_TYPE'] == 'cgllc.airmonitor.s1') {
+            //
+            $props = explode(',', XiaomiMiioConst::MIIO_AIRMONITOR_S1_PROPS);
+            $total = count($props);
+            for ($i = 0; $i < $total; $i++) {
+                $props[$i] = '"' . $props[$i] . '"';
+            }
+            $this->addToQueue($device_id, 'get_prop', '[' . implode(',', $props) . ']');
+        } elseif ($device_rec['DEVICE_TYPE'] == 'cgllc.airmonitor.b1') {
+            //
+            $this->addToQueue($device_id, 'get_air_data', '[]');
+        } elseif ($device_rec['DEVICE_TYPE'] == 'zhimi.airpurifier.mb3') {
+            $this->addToQueue($device_id, 'get_properties', '[{"did":"power","siid":2,"piid":2},{"did":"fan_level","siid":2,"piid":4},{"did":"mode","siid":2,"piid":5},{"did":"humidity","siid":3,"piid":7},{"did":"temperature","siid":3,"piid":8},{"did":"aqi","siid":3,"piid":6},{"did":"filter_life","siid":4,"piid":3},{"did":"filter_hours_used","siid":4,"piid":5},{"did":"buzzer","siid":5,"piid":1},{"did":"led_b","siid":6,"piid":1},{"did":"led","siid":6,"piid":6},{"did":"child_lock","siid":7,"piid":1},{"did":"favorite_level","siid":10,"piid":10}]');
+            $this->addToQueue($device_id, 'get_properties', '[{"did":"use_time","siid":12,"piid":1},{"did":"purify_volume","siid":13,"piid":1},{"did":"average_aqi","siid":13,"piid":2}]');
+        } elseif ($device_rec['DEVICE_TYPE'] == 'viomi.vacuum.v7') {
+            //
+            $props = explode(',', XiaomiMiioConst::MIIO_VIOMIVACUUM_V7_PROPS);
+            $total = count($props);
+            for ($i = 0; $i < $total; $i++) {
+                $props[$i] = '"' . $props[$i] . '"';
+            }
+            $this->addToQueue($device_id, 'get_prop', '[' . implode(',', $props) . ']');
+        } elseif (($device_rec['DEVICE_TYPE'] == 'yunmi.kettle.r1') || ($device_rec['DEVICE_TYPE'] == 'yunmi.kettle.r2') || ($device_rec['DEVICE_TYPE'] == 'yunmi.kettle.r3')) {
+            //
+            $props = explode(',', XiaomiMiioConst::MIIO_YUNMI_KETTLE_R1_PROPS);
+            $total = count($props);
+            for ($i = 0; $i < $total; $i++) {
+                $props[$i] = '"' . $props[$i] . '"';
+            }
+            $this->addToQueue($device_id, 'get_prop', '[' . implode(',', $props) . ']');
+        } elseif ($device_rec['DEVICE_TYPE'] == 'deerma.humidifier.mjjsq') {
+            //
+            $props = explode(',', XiaomiMiioConst::MIIO_DEERMA_HUMIDIFIER_MJJSQ_PROPS);
+            $total = count($props);
+            for ($i = 0; $i < $total; $i++) {
+                $props[$i] = '"' . $props[$i] . '"';
+            }
+            $this->addToQueue($device_id, 'get_prop', '[' . implode(',', $props) . ']');
+        } elseif (($device_rec['DEVICE_TYPE'] == 'deerma.humidifier.jsq') || ($device_rec['DEVICE_TYPE'] == 'deerma.humidifier.jsq1')) {
+            //
+            $props = explode(',', XiaomiMiioConst::MIIO_DEERMA_HUMIDIFIER_JSQ_PROPS);
+            $total = count($props);
+            for ($i = 0; $i < $total; $i++) {
+                $props[$i] = '"' . $props[$i] . '"';
+            }
+            $this->addToQueue($device_id, 'get_prop', '[' . implode(',', $props) . ']');
+        } elseif ($device_rec['DEVICE_TYPE'] == 'hfjh.fishbowl.v1') {
+            //
+            $props = explode(',', XiaomiMiioConst::MIIO_HFJH_FISHBOWL_V1_PROPS);
+            $total = count($props);
+            for ($i = 0; $i < $total; $i++) {
+                $props[$i] = '"' . $props[$i] . '"';
+            }
+            $this->addToQueue($device_id, 'get_prop', '[' . implode(',', $props) . ']');
+            $this->addToQueue($device_id, 'get_key_switch', '[]');
+        } elseif ($device_rec['DEVICE_TYPE'] == 'uvfive.s_lamp.slmap2') {
+            $this->addToQueue($device_id, 'get_properties', '[{"did":"power","siid":2,"piid":2},{"did":"state_code","siid":2,"piid":3},{"did":"poweroff_time","siid":2,"piid":6},{"did":"countdown","siid":2,"piid":7},{"did":"child_lock","siid":4,"piid":1}]');
+        } elseif ($device_rec['DEVICE_TYPE'] == '090615.switch.xswitch03') {
+            $this->addToQueue($device_id, 'get_prop', '[]');
+        } elseif ($device_rec['DEVICE_TYPE'] == 'dmaker.airfresh.a1') {
+            //
+            $props = explode(',', XiaomiMiioConst::MIIO_AIRFRESH_A1_PROPS);
+            $total = count($props);
+            for ($i = 0; $i < $total; $i++) {
+                $props[$i] = '"' . $props[$i] . '"';
+            }
+            $this->addToQueue($device_id, 'get_prop', '[' . implode(',', $props) . ']');
+        } elseif ($device_rec['DEVICE_TYPE'] == 'dreame.vacuum.mc1808') {
+            $this->addToQueue($device_id, 'get_properties', '[{"did":"state_code","siid":3,"piid":2},{"did":"error_code","siid":3,"piid":1},{"did":"battery","siid":2,"piid":1},{"did":"mode","siid":18,"piid":6},{"did":"work_mode","siid":18,"piid":1},{"did":"water_grade","siid":18,"piid":20},{"did":"clean_times","siid":18,"piid":14},{"did":"clean_area","siid":18,"piid":15},{"did":"clean_time","siid":18,"piid":13},{"did":"filter_life_level","siid":27,"piid":1},{"did":"filter_left_time","siid":27,"piid":2},{"did":"brush1_life_level","siid":26,"piid":2},{"did":"brush1_left_time","siid":26,"piid":1},{"did":"brush2_life_level","siid":28,"piid":2},{"did":"brush2_left_time","siid":28,"piid":1}]');
+        } elseif ($device_rec['DEVICE_TYPE'] == 'dreame.vacuum.p2140p') {
+            // https://github.com/rytilahti/python-miio/issues/1412
+            $props = array(
+                array('did' => 'battery_level', 'siid' => 3, 'piid' => 1),
+                array('did' => 'charging_state', 'siid' => 3, 'piid' => 2),
+                array('did' => 'device_mode', 'siid' => 2, 'piid' => 3),
+                array('did' => 'device_fault', 'siid' => 2, 'piid' => 2),
+                array('did' => 'device_status', 'siid' => 2, 'piid' => 1),
+                array('did' => 'brush_left_time', 'siid' => 9, 'piid' => 1),
+                array('did' => 'brush_life_level', 'siid' => 9, 'piid' => 2),
+                array('did' => 'filter_life_level', 'siid' => 11, 'piid' => 1),
+                array('did' => 'filter_left_time', 'siid' => 11, 'piid' => 2),
+                array('did' => 'brush_left_time2', 'siid' => 10, 'piid' => 1),
+                array('did' => 'brush_life_level2', 'siid' => 10, 'piid' => 2),
+                array('did' => 'operating_mode', 'siid' => 4, 'piid' => 1),
+                array('did' => 'cleaning_mode', 'siid' => 4, 'piid' => 4),
+                array('did' => 'timer_enable', 'siid' => 5, 'piid' => 1),
+                array('did' => 'cleaning_time', 'siid' => 4, 'piid' => 2),
+                array('did' => 'cleaning_area', 'siid' => 4, 'piid' => 3),
+                array('did' => 'first_clean_time', 'siid' => 12, 'piid' => 1),
+                array('did' => 'total_clean_time', 'siid' => 12, 'piid' => 2),
+                array('did' => 'total_clean_times', 'siid' => 12, 'piid' => 3),
+                array('did' => 'total_clean_area', 'siid' => 12, 'piid' => 4),
+                /*
+array('did'=>'start_time','siid'=>5,'piid'=>2),
+array('did'=>'stop_time','siid'=>5,'piid'=>3),
+array('did'=>'map_view','siid'=>6,'piid'=>1),
+array('did'=>'frame_info','siid'=>6,'piid'=>2),
+array('did'=>'object_name','siid'=>6,'piid'=>3),
+array('did'=>'map_extend_data','siid'=>6,'piid'=>4),
+array('did'=>'timezone','siid'=>8,'piid'=>1)
+array('did'=>'volume','siid'=>7,'piid'=>1),
+array('did'=>'voice_package','siid'=>7,'piid'=>2),
+array('did'=>'water_flow','siid'=>4,'piid'=>5),
+array('did'=>'water_box_carriage_status','siid'=>4,'piid'=>6),
+*/
+            );
+            //dprint(json_encode($props));
+            $this->addToQueue($device_id, 'get_properties', json_encode($props));
+            //$this->addToQueue($device_id, 'get_properties', '[{"did":"state_code","siid":3,"piid":2},{"did":"error_code","siid":3,"piid":1},{"did":"battery","siid":2,"piid":1},{"did":"mode","siid":18,"piid":6},{"did":"work_mode","siid":18,"piid":1},{"did":"water_grade","siid":18,"piid":20},{"did":"clean_times","siid":18,"piid":14},{"did":"clean_area","siid":18,"piid":15},{"did":"clean_time","siid":18,"piid":13},{"did":"filter_life_level","siid":27,"piid":1},{"did":"filter_left_time","siid":27,"piid":2},{"did":"brush1_life_level","siid":26,"piid":2},{"did":"brush1_left_time","siid":26,"piid":1},{"did":"brush2_life_level","siid":28,"piid":2},{"did":"brush2_left_time","siid":28,"piid":1}]');
+        } elseif ($device_rec['DEVICE_TYPE'] == 'chuangmi.plug.212a01') {
+            $this->addToQueue($device_id, 'get_properties', '[{"did":"power","piid":1,"siid":2},{"did":"temperature","piid":6,"siid":2},{"did":"power_consumption","piid":1,"siid":5},{"did":"current","piid":2,"siid":5},{"did":"voltage", "piid":3,"siid":5},{"did":"power_load","piid":6,"siid": 5}]');
+        } elseif ($device_rec['DEVICE_TYPE'] == 'zhimi.heater.zb1a') {
+            $props = array(
+                array('did' => 'on', 'siid' => 2, 'piid' => 2),
+                array('did' => 'target-temperature', 'siid' => 2, 'piid' => 6),
+                array('did' => 'relative-humidity', 'siid' => 5, 'piid' => 7),
+                array('did' => 'temperature', 'siid' => 5, 'piid' => 8)
+            );
+            $this->addToQueue($device_id, 'get_properties', json_encode($props));
+        } elseif ($device_rec['DEVICE_TYPE'] == 'zhimi.heater.mc2') {
+            $props = array(
+                array('did' => 'power', 'siid' => 2, 'piid' => 1),
+                array('did' => 'fault', 'siid' => 2, 'piid' => 2),
+                array('did' => 'target_temperature', 'siid' => 2, 'piid' => 5),
+                array('did' => 'buzzer', 'siid' => 6, 'piid' => 1),
+                array('did' => 'led', 'siid' => 7, 'piid' => 3),
+                array('did' => 'child_lock', 'siid' => 5, 'piid' => 1),
+                array('did' => 'countdown_time', 'siid' => 3, 'piid' => 1),
+                //array('did' => 'use_time', 'siid' => 8, 'piid' => 9),
+                //array('did' => 'button', 'siid' => 8, 'piid' => 1),
+                array('did' => 'temperature', 'siid' => 4, 'piid' => 7)
+            );
+            $this->addToQueue($device_id, 'get_properties', json_encode($props));
+        } elseif ($device_rec['DEVICE_TYPE'] == 'xiaomi.repeater.v6') {
+            // https://home.miot-spec.com/spec/xiaomi.repeater.v6
+        } elseif ($device_rec['DEVICE_TYPE'] == 'isa.camera.hlc7') {
+            $props = array(
+                array('did' => 'on', 'siid' => 2, 'piid' => 1)
+            );
+            $this->addToQueue($device_id, 'get_properties', json_encode($props));
+        } elseif ($device_rec['DEVICE_TYPE'] == 'mmgg.pet_waterer.s1') {
+            $props = array(
+                array('did' => 'fault', 'siid' => 2, 'piid' => 1),
+                array('did' => 'on', 'siid' => 2, 'piid' => 2),
+                array('did' => 'mode', 'siid' => 2, 'piid' => 3),
+                array('did' => 'filter-left-time', 'siid' => 3, 'piid' => 1),
+                array('did' => 'led', 'siid' => 4, 'piid' => 1),
+                array('did' => 'cotton-left-time', 'siid' => 5, 'piid' => 1),
+                array('did' => 'remain-clean-time', 'siid' => 6, 'piid' => 1),
+                array('did' => 'water', 'siid' => 7, 'piid' => 1),
+                array('did' => 'no-water-time', 'siid' => 7, 'piid' => 2),
+                array('did' => 'pump-block-flag', 'siid' => 7, 'piid' => 3),
+                array('did' => 'lid-up-flag', 'siid' => 7, 'piid' => 4),
+
+            );
+            $this->addToQueue($device_id, 'get_properties', json_encode($props));
+        }
+
+    }
+    function api($params)
+    {
+        //callAPI('/api/module/xiaomimiio','GET',array('did'=>$id,'dcmd'=>$command,'dopt'=>$options));
+        if (!empty($params['did']) && !empty($params['dcmd'])) {
+            $device = SQLSelectOne("SELECT * FROM miio_devices WHERE ID=" . (int)$params['did']);
+            if (!$device['ID']) return;
+            $dip = $device['IP'];
+            $dtoken = $device['TOKEN'];
+            $cmd = $params['dcmd'];
+            $opt = $params['dopt'] ?? $params['opt'] ?? '[]';
+            if (!class_exists('miIO', false)) {
+                include_once(DIR_MODULES . 'xiaomimiio/lib/miio.class.php');
+            }
+            $this->getConfig();
+            if (!empty($this->config['API_IP'])) $bind_ip = $this->config['API_IP'];
+            else $bind_ip = '0.0.0.0';
+            if (!empty($this->config['API_LOG_MIIO'])) $miio_debug = true;
+            else $miio_debug = false;
+            $dev = new miIO($dip, $bind_ip, $dtoken, $miio_debug);
+            if ($this->config['API_SOCKET_TIMEOUT'] !== null) {
+                $dev->send_timeout = (int)$this->config['API_SOCKET_TIMEOUT'];
+            }
+            $dev->msgSendRcv($cmd, $opt, time());
+            $info = $dev->data;
+            echo $info;
+        }
+    }
+    /**
+     * propertySetHandle
+     *
+     * Обработчик привязанных свойств и методов
+     *
+     * @access private
+     */
+
+    function propertySetHandle($object, $property, $value)
+    {
+
+        $this->getConfig();
+
+        $table = 'miio_commands';
+
+        $properties = SQLSelect("SELECT miio_commands.*, miio_devices.TOKEN, miio_devices.DEVICE_TYPE FROM miio_commands LEFT JOIN miio_devices ON miio_devices.ID=miio_commands.DEVICE_ID WHERE miio_commands.LINKED_OBJECT = '" . DBSafe($object) . "' AND miio_commands.LINKED_PROPERTY = '" . DBSafe($property) . "'");
+
+        /*
+            ID	TITLE	NOTE	VALUE	DEVICE_ID	LINKED_OBJECT	LINKED_PROPERTY	LINKED_METHOD	UPDATE				TOKEN	DEVICE_TYPE
+            122	power	""		0		19			miioRelay01		status			""				2018-03-20 00:50:34	xxxxx	yeelink.light.mono1
+        */
+
+        $total = count($properties);
+
+        if ($total) {
+            for ($i = 0; $i < $total; $i++) {
+                // Если есть токен, то обрабатываем команду и ставим ее в очередь. Без токена ничего не делаем.
+                if ($properties[$i]['TOKEN'] != '') {
+                    if ($properties[$i]['TITLE'] == 'command') {
+                        if ($value == 'prop_update') {
+                            // Обновление сведений об устройстве по запросу
+                            $this->requestStatus($properties[$i]['DEVICE_ID']);
+                            if (!empty($this->config['API_LOG_DEBMES'])) DebMes('Manual update the properties of the device ' . $properties[$i]['DEVICE_ID'], 'xiaomimiio');
+                        } else if ($properties[$i]['DEVICE_TYPE'] == 'viomi.vacuum.v7') {
+                            if ($value == 'app_start') {
+                                $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_mode_withroom', '[0,1,0]');
+                            } else if ($value == 'app_stop') {
+                                $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_mode', '[0]');
+                            } else if ($value == 'app_pause') {
+                                $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_mode_withroom', '[0,2,0]');
+                            } else if ($value == 'app_charge') {
+                                $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_charge', '[1]');
+                            } else {
+                                $this->addToQueue($properties[$i]['DEVICE_ID'], $value, '[]');
+                            }
+                        } else if ($properties[$i]['DEVICE_TYPE'] == 'dreame.vacuum.mc1808') {
+                            if ($value == 'app_start') {
+                                $params = '{"did":"app_start","siid":18,"aiid":1,"in":[{"piid":1,"value":2}]}';
+                            } else if ($value == 'app_stop') {
+                                $params = '{"did":"app_stop","siid":18,"aiid":2,"in":[]}';
+                            } else if ($value == 'app_charge') {
+                                $params = '{"did":"app_charge","siid":2,"aiid":1,"in":[]}';
+                            } else if ($value == 'find_me') {
+                                $params = '{"did":"find_me","siid":17,"aiid":1}';
+                            } else if ($value == 'start_sweep') {
+                                $params = '{"did":"start_sweep","siid":3,"aiid":1,"in":[]}';
+                            } else if ($value == 'stop_sweep') {
+                                $params = '{"did":"stop_sweep","siid":3,"aiid":2,"in":[]}';
+                            } else {
+                                $this->addToQueue($properties[$i]['DEVICE_ID'], $value, '[]');
+                            }
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'action', $params);
+                        } else if ($properties[$i]['DEVICE_TYPE'] == 'dreame.vacuum.p2140p') {
+                            //todo: fix
+                            if ($value == 'app_start') {
+                                $params = '{"did":"app_start","siid":4,"aiid":1}';
+                            } else if ($value == 'app_stop') {
+                                $params = '{"did":"app_stop","siid":4,"aiid":2}';
+                            } else if ($value == 'app_charge') {
+                                $params = '{"did":"app_charge","siid":3,"aiid":1}';
+                            } else if ($value == 'find_me') {
+                                $params = '{"did":"find_me","siid":7,"aiid":2}';
+                            } else if ($value == 'start_sweep') {
+                                $params = '{"did":"start_sweep","siid":2,"aiid":1}';
+                            } else if ($value == 'stop_sweep') {
+                                $params = '{"did":"stop_sweep","siid":2,"aiid":2}';
+                            } else {
+                                $this->addToQueue($properties[$i]['DEVICE_ID'], $value, '[]');
+                            }
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'action', $params);
+                        } else if ($properties[$i]['DEVICE_TYPE'] == 'mmgg.pet_waterer.s1') {
+                            if ($value == 'reset-filter-life') {
+                                $params = '{"did":"reset-filter-life","siid":3,"aiid":1}';
+                            } else if ($value == 'reset-cotton-life') {
+                                $params = '{"did":"reset-cotton-life","siid":5,"aiid":1}';
+                            } else if ($value == 'reset-clean-time') {
+                                $params = '{"did":"reset-clean-time","siid":6,"aiid":1}';
+                            } else if ($value == 'reset-device') {
+                                $params = '{"did":"reset-device","siid":8,"aiid":1}';
+                            } else {
+                                $this->addToQueue($properties[$i]['DEVICE_ID'], $value, '[]');
+                            }
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'action', $params);
+                        } else {
+                            // Отправка любой команды (метода) без параметров.
+                            // Например, miIO.info, toggle, app_start и др.
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], $value, '[]');
+                        }
+                        //TODO: после отправки команды желательно обновить сведения об устройстве,
+                        //но при этом перезапишется поле message (удалится результат выполнения команды),
+                        //что может быть неприемлемо.
+                        //$this->requestStatus($properties[$i]['DEVICE_ID']);
+                    } elseif ($properties[$i]['TITLE'] == 'power') {
+                        // Команда на включение и выключение
+                        $method = 'set_power';
+                        if ($properties[$i]['DEVICE_TYPE'] == 'zhimi.airpurifier.mb3' || $properties[$i]['DEVICE_TYPE'] == 'uvfive.s_lamp.slmap2') {
+                            $method = 'set_properties';
+                            $params = '[{"did":"power","siid":2,"piid":2,"value":' . ($value ? 'true' : 'false') . '}]';
+                        } else if ($properties[$i]['DEVICE_TYPE'] == 'zhimi.humidifier.ca4') {
+                            $method = 'set_properties';
+                            $params = '[{"did":"power","siid":2,"piid":1,"value":' . ($value ? 'true' : 'false') . '}]';
+                        } else if ($properties[$i]['DEVICE_TYPE'] == 'deerma.humidifier.jsq5' || $properties[$i]['DEVICE_TYPE'] == 'deerma.humidifier.jsq2g') {
+                            $method = 'set_properties';
+                            $params = '[{"did":"power","siid":2,"piid":1,"value":' . ($value ? 'true' : 'false') . '}]';
+						} else if ($properties[$i]['DEVICE_TYPE'] == 'chuangmi.plug.212a01') {
+                            $method = 'set_properties';
+                            $params = '[{"did":"power","siid":2,"piid":1,"value":' . ($value ? 'true' : 'false') . '}]';
+                        } else if ($properties[$i]['DEVICE_TYPE'] == 'lumi.acpartner.v3') {
+                            $method = 'toggle_plug';
+                            $params = $value ? '["on"]' : '["off"]';
+                        } else if ($properties[$i]['DEVICE_TYPE'] == 'deerma.humidifier.mjjsq' || $properties[$i]['DEVICE_TYPE'] == 'deerma.humidifier.jsq' || $properties[$i]['DEVICE_TYPE'] == 'deerma.humidifier.jsq1') {
+                            $method = 'Set_OnOff';
+                            $params = '[' . (int)$value . ']';
+                        } else if ($properties[$i]['DEVICE_TYPE'] == 'dmaker.airfresh.a1') {
+                            $params = $value ? '[true]' : '[false]';
+                        } else {
+                            $params = $value ? '["on"]' : '["off"]';
+                        }
+                        $this->addToQueue($properties[$i]['DEVICE_ID'], $method, $params);
+                        // TO-DO: Если у-во yeelight, то используем дополнительные опции команды (effect, duration, mode).
+                    } elseif ($properties[$i]['TITLE'] == 'bg_power') {
+                        // Команда на включение и выключение дополнительной подсветки
+                        if ($value) {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'bg_set_power', '["on"]');
+                        } else {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'bg_set_power', '["off"]');
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'buzzer') {
+                        // Команда на включение и выключение пищалки
+                        $method = 'set_buzzer';
+                        if ($properties[$i]['DEVICE_TYPE'] == 'zhimi.fan.sa1') {
+                            $params = $value ? '[2]' : '[0]';
+                        } else if ($properties[$i]['DEVICE_TYPE'] == 'zhimi.airpurifier.mb3') {
+                            $method = 'set_properties';
+                            $params = '[{"did":"buzzer","siid":5,"piid":1,"value":' . ($value ? 'true' : 'false') . '}]';
+                        } else if ($properties[$i]['DEVICE_TYPE'] == 'zhimi.humidifier.ca4') {
+                            $method = 'set_properties';
+                            $params = '[{"did":"buzzer","siid":4,"piid":1,"value":' . ($value ? 'true' : 'false') . '}]';
+						} else if ($properties[$i]['DEVICE_TYPE'] == 'deerma.humidifier.jsq5' || $properties[$i]['DEVICE_TYPE'] == 'deerma.humidifier.jsq2g') {
+                            $method = 'set_properties';
+                            $params = '[{"did":"buzzer","siid":5,"piid":1,"value":' . ($value ? 'true' : 'false') . '}]';
+                        } else if ($properties[$i]['DEVICE_TYPE'] == 'deerma.humidifier.mjjsq' || $properties[$i]['DEVICE_TYPE'] == 'deerma.humidifier.jsq' || $properties[$i]['DEVICE_TYPE'] == 'deerma.humidifier.jsq1') {
+                            $method = 'SetTipSound_Status';
+                            $params = '[' . (int)$value . ']';
+                        } else if ($properties[$i]['DEVICE_TYPE'] == 'dmaker.airfresh.a1') {
+                            $method = 'set_sound';
+                            $params = $value ? '[true]' : '[false]';
+                        } else {
+                            $params = $value ? '["on"]' : '["off"]';
+                        }
+                        $this->addToQueue($properties[$i]['DEVICE_ID'], $method, $params);
+                    } elseif ($properties[$i]['TITLE'] == 'bright') {
+                        // Команда на изменение яркости (в % от 1 до 100)
+                        $value = (int)$value;
+                        if ($value < 1) $value = 1;
+                        if ($value > 100) $value = 100;
+                        $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_bright', "[$value]");
+                    } elseif ($properties[$i]['TITLE'] == 'bg_bright') {
+                        // Команда на изменение яркости дополнительной подсветки (в % от 1 до 100)
+                        $value = (int)$value;
+                        if ($value < 1) $value = 1;
+                        if ($value > 100) $value = 100;
+                        $this->addToQueue($properties[$i]['DEVICE_ID'], 'bg_set_bright', "[$value]");
+                    } elseif ($properties[$i]['TITLE'] == 'cct') {
+                        // Команда на изменение цветовой температуры (в % от 1 до 100)
+                        $value = (int)$value;
+                        if ($value < 1) $value = 1;
+                        if ($value > 100) $value = 100;
+                        $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_cct', "[$value]");
+                    } elseif ($properties[$i]['TITLE'] == 'ct') {
+                        // Команда на изменение цветовой температуры (в кельвинах от 1700 до 6500)
+                        $value = (int)$value;
+                        if ($value < 1700) $value = 1700;
+                        if ($value > 6500) $value = 6500;
+                        $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_ct_abx', '[' . $value . ',"sudden",200]');
+                    } elseif ($properties[$i]['TITLE'] == 'bg_ct') {
+                        // Команда на изменение цветовой температуры дополнительной подсветки (в кельвинах от 1700 до 6500)
+                        $value = (int)$value;
+                        if ($value < 1700) $value = 1700;
+                        if ($value > 6500) $value = 6500;
+                        $this->addToQueue($properties[$i]['DEVICE_ID'], 'bg_set_ct_abx', '[' . $value . ',"sudden",200]');
+                    } elseif ($properties[$i]['TITLE'] == 'rgb') {
+                        // Команда на изменение цвета RGB (от 0 до 16777215)
+                        // RGB = (R*65536)+(G*256)+B, где R, G и B десятичные значения от 0 до 255.
+                        $value = preg_replace('/^#/', '', $value);
+                        $val = hexdec($value);
+                        if ($val != 0 && $val < 16777216) {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_rgb', '[' . $val . ',"smooth",100]');
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'bg_rgb') {
+                        // Команда на изменение цвета RGB дополнительной подсветки (от 0 до 16777215)
+                        $value = preg_replace('/^#/', '', $value);
+                        $val = hexdec($value);
+                        if ($val != 0 && $val < 16777216) {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'bg_set_rgb', '[' . $val . ',"smooth",100]');
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'wifi_led') {
+                        // Команда на включение и выключение индикатора wifi
+                        if ($value) {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_wifi_led', '["on"]');
+                        } else {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_wifi_led', '["off"]');
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'usb_on') {
+                        // Команда на включение и выключение usb-порта розетки
+                        if ($value) {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_usb_on', '[]');
+                        } else {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_usb_off', '[]');
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'ir_play') {
+                        // Команда для отправки IR-кода
+                        if ($properties[$i]['DEVICE_TYPE'] == 'chuangmi.ir.v2') {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'miIO.ir_play', '{"freq":38400,"code":"' . $value . '"}');
+                        } else if ($properties[$i]['DEVICE_TYPE'] == 'lumi.acpartner.v3') {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'send_ir_code', '["' . $value . '"]');
+                        }
+                        //{"id":1,"method":"miIO.ir_play","params":{"freq":38400,"code":"Z6VHABACAABE...QA="}}
+                    } elseif ($properties[$i]['TITLE'] == 'snm') {
+                        // Установить фиксированные сцены
+                        // 1-Яркий, 2-ТВ, 3-тёплый, 4-ночь
+                        // 1-Учеба, 2-Чтение, 3-Компьютер
+                        if ($value < 1) $value = 1;
+                        if ($properties[$i]['DEVICE_TYPE'] == 'philips.light.sread1') {
+                            if ($value > 3) $value = 3;
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_user_scene', "[$value]");
+                        } else {
+                            if ($value > 4) $value = 4;
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'apply_fixed_scene', "[$value]");
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'dv') {
+                        // Таймер отключения (в секундах/минутах)
+                        if ($value < 0) $value = 1;
+                        if ($properties[$i]['DEVICE_TYPE'] == 'philips.light.sread1') {
+                            // минуты
+                            if ($value > 60) $value = 60;
+                        } else {
+                            // секунды
+                            if ($value > 21600) $value = 21600;
+                        }
+                        $this->addToQueue($properties[$i]['DEVICE_ID'], 'delay_off', "[$value]");
+                    } elseif ($properties[$i]['TITLE'] == 'bl') {
+                        // Интеллектуальный ночник
+                        if ($properties[$i]['DEVICE_TYPE'] == 'philips.light.sread1') {
+                            $value = $value ? '["on"]' : '["off"]';
+                        } else {
+                            $value = $value ? '[1]' : '[0]';
+                        }
+                        $this->addToQueue($properties[$i]['DEVICE_ID'], 'enable_bl', $value);
+                    } elseif ($properties[$i]['TITLE'] == 'ac') {
+                        // Автонастройка цветовой температуры
+                        if ($value) {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'enable_ac', '[1]');
+                        } else {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'enable_ac', '[0]');
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'nl_br') {
+                        // Ночной режим (ночник, "луна")
+                        if ($value) {
+                            $bright = SQLSelectOne("SELECT miio_commands.VALUE FROM miio_commands WHERE miio_commands.TITLE LIKE 'bright' AND DEVICE_ID=" . $properties[$i]['DEVICE_ID']);
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_scene', '["nightlight",' . $bright['VALUE'] . ']');
+                        } else {
+                            $ct = SQLSelectOne("SELECT miio_commands.VALUE FROM miio_commands WHERE miio_commands.TITLE LIKE 'ct' AND DEVICE_ID=" . $properties[$i]['DEVICE_ID']);
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_ct_abx', '[' . $ct['VALUE'] . ',"sudden",100]');
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'vol_up') {
+                        // Команда увеличения громкости на указанную величину
+                        $value = (int)$value;
+                        if ($value < 1) $value = 1;
+                        if ($value > 100) $value = 100;
+                        $this->addToQueue($properties[$i]['DEVICE_ID'], 'vol_up', "[$value]");
+                    } elseif ($properties[$i]['TITLE'] == 'vol_down') {
+                        // Команда уменьшения громкости на указанную величину
+                        $value = (int)$value;
+                        if ($value < 1) $value = 1;
+                        if ($value > 100) $value = 100;
+                        $this->addToQueue($properties[$i]['DEVICE_ID'], 'vol_down', "[$value]");
+                    } elseif ($properties[$i]['TITLE'] == 'led_brightness') {
+                        if ($properties[$i]['DEVICE_TYPE'] == 'zhimi.humidifier.ca4') {
+                                switch ($value) {
+                                case 'off':
+                                    $params = 0;
+                                    break;
+                                case 'dim':
+                                    $params = 1;
+                                    break;
+                                case 'bright':
+                                    $params = 2;
+                                    break;
+                                default:
+                                    $params = 0;
+                                    break;
+                            }
+                            if (is_numeric($value) && $value >=0 && $value <= 2) $params=$value;
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_properties', '[{"did":"led_brightness","siid":5,"piid":2,"value":' . $params . '}]');
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'led') {
+                        //
+                        $method = 'set_led';
+                        if ($properties[$i]['DEVICE_TYPE'] == 'zhimi.airpurifier.mb3') {
+                            $method = 'set_properties';
+                            $params = '[{"did":"led","siid":6,"piid":6,"value":' . ($value ? 'true' : 'false') . '}]';
+					} else if ($properties[$i]['DEVICE_TYPE'] == 'deerma.humidifier.jsq5' || $properties[$i]['DEVICE_TYPE'] == 'deerma.humidifier.jsq2g') {
+                            $method = 'set_properties';
+                            $params = '[{"did":"led","siid":6,"piid":1,"value":' . ($value ? 'true' : 'false') . '}]';
+					} else if ($properties[$i]['DEVICE_TYPE'] == 'deerma.humidifier.mjjsq' || $properties[$i]['DEVICE_TYPE'] == 'deerma.humidifier.jsq' || $properties[$i]['DEVICE_TYPE'] == 'deerma.humidifier.jsq1') {
+                            $method = 'SetLedState';
+                            $params = '[' . (int)$value . ']';
+                    } else if ($properties[$i]['DEVICE_TYPE'] == 'dmaker.airfresh.a1') {
+                            $method = 'set_display';
+                            $params = $value ? '[true]' : '[false]';
+                    } else {
+                            $params = $value ? '["on"]' : '["off"]';
+                    }
+                        $this->addToQueue($properties[$i]['DEVICE_ID'], $method, $params);
+                    } elseif ($properties[$i]['TITLE'] == 'child_lock') {
+                        //
+                        $method = 'set_child_lock';
+                        if ($properties[$i]['DEVICE_TYPE'] == 'zhimi.airpurifier.mb3') {
+                            $method = 'set_properties';
+                            $params = '[{"did":"child_lock","siid":7,"piid":1,"value":' . ($value ? 'true' : 'false') . '}]';
+                        } else if ($properties[$i]['DEVICE_TYPE'] == 'zhimi.humidifier.ca4') {
+                            $method = 'set_properties';
+                            $params = '[{"did":"child_lock","siid":6,"piid":1,"value":' . ($value ? 'true' : 'false') . '}]';
+                        } else if ($properties[$i]['DEVICE_TYPE'] == 'uvfive.s_lamp.slmap2') {
+                            $method = 'set_properties';
+                            $params = '[{"did":"child_lock","siid":4,"piid":1,"value":' . ($value ? 'true' : 'false') . '}]';
+                        } else if ($properties[$i]['DEVICE_TYPE'] == 'hfjh.fishbowl.v1') {
+                            $method = 'set_key_switch';
+                            $params = $value ? '[true]' : '[false]';
+                        } else if ($properties[$i]['DEVICE_TYPE'] == 'dmaker.airfresh.a1') {
+                            $params = $value ? '[true]' : '[false]';
+                        } else {
+                            $params = $value ? '["on"]' : '["off"]';
+                        }
+                        $this->addToQueue($properties[$i]['DEVICE_ID'], $method, $params);
+                    } elseif ($properties[$i]['TITLE'] == 'favorite_level') {
+                        //
+                        $value = (int)$value;
+                        $method = 'set_level_favorite';
+                        if ($properties[$i]['DEVICE_TYPE'] == 'zhimi.airpurifier.mb3') {
+                            $method = 'set_properties';
+                            if ($value < 0) $value = 0;
+                            if ($value > 14) $value = 14;
+                            $params = '[{"did":"favorite_level","siid":10,"piid":10,"value":' . $value . '}]';
+                        } else {
+                            if ($value < 0) $value = 0;
+                            if ($value > 100) $value = 100;
+                            $params = '[' . $value . ']';
+                        }
+                        $this->addToQueue($properties[$i]['DEVICE_ID'], $method, $params);
+                    } elseif ($properties[$i]['TITLE'] == 'fan_level') {
+                        //
+                        $value = (int)$value;
+                        $method = 'set_properties';
+                        if ($properties[$i]['DEVICE_TYPE'] == 'zhimi.airpurifier.mb3') {
+                            if ($value < 1) $value = 1;
+                            if ($value > 3) $value = 3;
+                            $params = '[{"did":"fan_level","siid":2,"piid":4,"value":' . $value . '}]';
+                        } elseif ($properties[$i]['DEVICE_TYPE'] == 'deerma.humidifier.jsq5' || $properties[$i]['DEVICE_TYPE'] == 'deerma.humidifier.jsq2g') {
+                            if ($value < 1) $value = 1;
+                            if ($value > 4) $value = 4;
+                            $params = '[{"did":"fan_level","siid":2,"piid":5,"value":' . $value . '}]';
+                        }
+			
+                        $this->addToQueue($properties[$i]['DEVICE_ID'], $method, $params);
+                    } elseif ($properties[$i]['TITLE'] == 'dry' && $properties[$i]['DEVICE_TYPE'] == 'zhimi.humidifier.ca4') {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_properties', '[{"did":"dry","siid":2,"piid":8"value":' . ($value ? 'true' : 'false') . '}]');
+                                                    
+                    } elseif ($properties[$i]['TITLE'] == 'dry') {
+                        //
+                        if ($value) {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_dry', '["on"]');
+                        } else {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_dry', '["off"]');
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'led_b') {
+                        // Управление светодиодом (подсветкой)
+                        switch ($value) {
+                            case 'bright':
+                                $params = 0;
+                                break;
+                            case 'dim':
+                                $params = 1;
+                                break;
+                            case 'off':
+                                $params = 2;
+                                break;
+                            default:
+                                $params = 0;
+                                break;
+                        }
+                        if ($properties[$i]['DEVICE_TYPE'] == 'zhimi.airpurifier.mb3') {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_properties', '[{"did":"led_b","siid":6,"piid":1,"value":' . $params . '}]');
+                        } else {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_led_b', '["' . $params . '"]');
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'mode') {
+                        //
+                        if ($properties[$i]['DEVICE_TYPE'] == 'zhimi.humidifier.v1') {
+                            // Изменение режима (silent, medium, high)
+                            if ($value == 'silent' || $value == 'medium' || $value == 'high') {
+                                $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_mode', '["' . $value . '"]');
+                            }
+                        } elseif ($properties[$i]['DEVICE_TYPE'] == 'zhimi.humidifier.ca1') {
+                            // Изменение режима (auto, silent, medium, high)
+                            if ($value == 'auto' || $value == 'silent' || $value == 'medium' || $value == 'high') {
+                                $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_mode', '["' . $value . '"]');
+                            }
+                        } elseif ($properties[$i]['DEVICE_TYPE'] == 'zhimi.airpurifier.ma2') {
+                            // Изменение режима (silent, auto, favorite)
+                            if ($value == 'silent' || $value == 'auto' || $value == 'favorite') {
+                                $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_mode', '["' . $value . '"]');
+                            }
+                        } elseif ($properties[$i]['DEVICE_TYPE'] == 'zhimi.airpurifier.v3') {
+                            // Изменение режима (auto, silent, strong, low, medium, high, idle)
+                            if ($value == 'auto' || $value == 'silent' || $value == 'strong' || $value == 'low' ||
+                                $value == 'medium' || $value == 'high' || $value == 'idle') {
+                                $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_mode', '["' . $value . '"]');
+                            }
+                        } elseif ($properties[$i]['DEVICE_TYPE'] == 'zhimi.airpurifier.mb3') {
+                            switch ($value) {
+                                case 'auto':
+                                    $params = 0;
+                                    break;
+                                case 'silent':
+                                    $params = 1;
+                                    break;
+                                case 'favorite':
+                                    $params = 2;
+                                    break;
+                                case 'fan':
+                                    $params = 3;
+                                    break;
+                                default:
+                                    $params = 0;
+                                    break;
+                            }
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_properties', '[{"did":"mode","siid":2,"piid":5,"value":' . $params . '}]');
+                        } elseif ($properties[$i]['DEVICE_TYPE'] == 'zhimi.humidifier.ca4') {
+                            switch ($value) {
+                                case 'auto':
+                                    $params = 0;
+                                    break;
+                                case 'silent':
+                                    $params = 1;
+                                    break;
+                                case 'medium':
+                                    $params = 2;
+                                    break;
+                                case 'high':
+                                    $params = 3;
+                                    break;
+                                default:
+                                    $params = 0;
+                                    break;
+                            }
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_properties', '[{"did":"mode","siid":2,"piid":5,"value":' . $params . '}]');
+
+                        } elseif ($properties[$i]['DEVICE_TYPE'] == 'viomi.vacuum.v7') {
+                            switch ($value) {
+                                case 'Vacuum':
+                                    $params = 0;
+                                    break;
+                                case 'VacuumAndMop':
+                                    $params = 1;
+                                    break;
+                                case 'Mop':
+                                    $params = 2;
+                                    break;
+                                default:
+                                    $params = 0;
+                                    break;
+                            }
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_mop', '[' . $params . ']');
+                        } elseif ($properties[$i]['DEVICE_TYPE'] == 'deerma.humidifier.mjjsq' || $properties[$i]['DEVICE_TYPE'] == 'deerma.humidifier.jsq' || $properties[$i]['DEVICE_TYPE'] == 'deerma.humidifier.jsq1') {
+                            switch ($value) {
+                                case 'low':
+                                    $params = 1;
+                                    break;
+                                case 'medium':
+                                    $params = 2;
+                                    break;
+                                case 'high':
+                                    $params = 3;
+                                    break;
+                                case 'humidity':
+                                    $params = 4;
+                                    break;
+                                default:
+                                    $params = 1;
+                                    break;
+                            }
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'Set_HumidifierGears', '[' . $params . ']');
+                        } elseif ($properties[$i]['DEVICE_TYPE'] == 'dmaker.airfresh.a1') {
+                            if ($value == 'auto' || $value == 'favourite' || $value == 'sleep') {
+                                $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_mode', '["' . $value . '"]');
+                            }
+                        } elseif ($properties[$i]['DEVICE_TYPE'] == 'dreame.vacuum.mc1808') {
+                            switch ($value) {
+                                case 'Silent':
+                                    $params = 0;
+                                    break;
+                                case 'Standard':
+                                    $params = 1;
+                                    break;
+                                case 'Medium':
+                                    $params = 2;
+                                    break;
+                                case 'Turbo':
+                                    $params = 3;
+                                    break;
+                            }
+                            $params = '[{"did":"mode","siid":18,"piid":6,"value":' . $value . '}]';
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_properties', $params);
+                        } elseif ($properties[$i]['DEVICE_TYPE'] == 'dreame.vacuum.p2140p') {
+                            switch ($value) {
+                                case 'Silent':
+                                    $params = 0;
+                                    break;
+                                case 'Basic':
+                                    $params = 1;
+                                    break;
+                                case 'Strong':
+                                    $params = 2;
+                                    break;
+                                case 'Full Speed':
+                                    $params = 3;
+                                    break;
+                            }
+                            $params = '[{"did":"mode","siid":2,"piid":3,"value":' . $value . '}]';
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_properties', $params);
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'custom_mode') {
+                        // Изменение режима работы (мощности) пылесоса (от 1 до 100%, 101 - влажная уборка, 105 - турбо)
+                        $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_custom_mode', '[' . $value . ']');
+                    } elseif ($properties[$i]['TITLE'] == 'zoned_clean') {
+                        // Уборка указанных зон (параметры - либо одна зона [[zone1]], либо список зон [[zone1],[zone2]])
+                        // [x1 Integer, y1 Integer, x2 Integer, y2 Integer, times Integer]
+                        // {"id":8338,"method":"app_zoned_clean","params":[[26234,26042,27284,26642,5]]}
+                        // {"id":8338,"method":"app_zoned_clean","params":[[26234,26042,27284,26642,1],[26232,25304,27282,25804,2],[26246,24189,27296,25139,3]]}
+                        $this->addToQueue($properties[$i]['DEVICE_ID'], 'app_zoned_clean', '[' . $value . ']');
+                    } elseif ($properties[$i]['TITLE'] == 'segment_clean') {
+                        // Уборка указанных сегментов (комнат) по их идентификаторам
+                        // {"id":8338,"method":"app_segment_clean","params":[1,2,3,4,10]}
+                        $this->addToQueue($properties[$i]['DEVICE_ID'], 'app_segment_clean', '[' . $value . ']');
+                    } elseif ($properties[$i]['TITLE'] == 'goto_target') {
+                        // Движение в заданную точку (параметры [x Integer, y Integer])
+                        // {"id": 25736111,"method": "app_goto_target","params": [24200,20200]}
+                        $this->addToQueue($properties[$i]['DEVICE_ID'], 'app_goto_target', '[' . $value . ']');
+                    } elseif ($properties[$i]['TITLE'] == 'flow') {
+                        //
+                        if ($value != '') {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'start_cf', "[$value]");
+                        } else {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'stop_cf', '[]');
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'bg_flow') {
+                        //
+                        if ($value != '') {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'bg_start_cf', "[$value]");
+                        } else {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'bg_stop_cf', '[]');
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'filter1_life') {
+                        // Сброс ресурса фильтра
+                        if ($value == '0' || $value == '') {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_f1_hour_used', '[0]');
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'limit_hum') {
+                        // Установка верхнего предела увлажнения (30, 40, 50, 60, 70, 80)
+                        $value = (int)$value;
+                        if (($value >= 30) && ($value <= 80) && (($value % 10) == 0)) {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_limit_hum', "[$value]");
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'speed_level') {
+                        // Уровень скорости вращения в обычном режиме (от 1 до 100)
+                        if ($value) {
+                            $value = (int)$value;
+                            
+                            if ($properties[$i]['DEVICE_TYPE'] == 'zhimi.humidifier.ca4') {
+                            if ($value < 200) $value = 200;
+                            if ($value > 2000) $value = 2000;
+                            $params = '[{"did":"fan_level","siid":2,"piid":11,"value":' . $value . '}]';
+                        } else {
+                            if ($value < 0) $value = 0;
+                            if ($value > 100) $value = 100;
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_speed_level', '[' . $value . ']');
+                        }
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'angle') {
+                        // Команда на включение выключение автоматического поворота вентилятора
+                        if ($value) {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_angle', '[' . $value . ']');
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'natural_level') {
+                        // Уровень скорости вращения в режиме "натуральный ветер" (от 1 до 100)
+                        if ($value) {
+                            $value = (int)$value;
+                            if ($value < 0) $value = 0;
+                            if ($value > 100) $value = 100;
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_natural_level', '[' . $value . ']');
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'poweroff_time') {
+                        // Команда на изменения таймера выключения
+                        if ($properties[$i]['DEVICE_TYPE'] == 'uvfive.s_lamp.slmap2') {
+                            $value = (int)$value;
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_properties', '[{"did":"poweroff_time","siid":2,"piid":6,"value":' . $value . '}]');
+                        } else {
+                            if ($value) {
+                                $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_poweroff_time', '[' . $value . ']');
+                            }
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'angle_enable') {
+                        // Команда на включение и выключение автоматического поворота вентилятора
+                        if ($value) {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_angle_enable', '["on"]');
+                        } else {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_angle_enable', '["off"]');
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'eyecare') {
+                        // Команда на включение и выключение автоматической подстройки яркости
+                        if ($value) {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_eyecare', '["on"]');
+                        } else {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_eyecare', '["off"]');
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'ambstatus') {
+                        // Команда на включение и выключение дополнительной подсветки
+                        if ($value) {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'enable_amb', '["on"]');
+                        } else {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'enable_amb', '["off"]');
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'ambvalue') {
+                        // Команда на изменение яркости дополнительной подсветки (в % от 1 до 100)
+                        $value = (int)$value;
+                        if ($value < 1) $value = 1;
+                        if ($value > 100) $value = 100;
+                        $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_amb_bright', "[$value]");
+                    } elseif ($properties[$i]['TITLE'] == 'notifystatus') {
+                        // Команда на включение и выключение напоминания об усталости глаз
+                        if ($value) {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_notifyuser', '["on"]');
+                        } else {
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_notifyuser', '["off"]');
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'suction_grade') {
+                        // Команда на изменение мощности всасывания
+                        if ($properties[$i]['DEVICE_TYPE'] == 'viomi.vacuum.v7') {
+                            switch ($value) {
+                                case 'Silent':
+                                    $params = 0;
+                                    break;
+                                case 'Standard':
+                                    $params = 1;
+                                    break;
+                                case 'Medium':
+                                    $params = 2;
+                                    break;
+                                case 'Turbo':
+                                    $params = 3;
+                                    break;
+                                default:
+                                    $params = 2;
+                                    break;
+                            }
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_suction', '[' . $params . ']');
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'target_humidity') {
+                        // Установка верхнего предела увлажнения (в % от 0 до 99)
+                        $value = (int)$value;
+                        if ($properties[$i]['DEVICE_TYPE'] == 'deerma.humidifier.mjjsq' || $properties[$i]['DEVICE_TYPE'] == 'deerma.humidifier.jsq' || $properties[$i]['DEVICE_TYPE'] == 'deerma.humidifier.jsq1') {
+                            if ($value < 0) $value = 0;
+                            if ($value > 99) $value = 99;
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'Set_HumiValue', '[' . $value . ']');
+                        } else if ($properties[$i]['DEVICE_TYPE'] == 'zhimi.humidifier.ca4' || $properties[$i]['DEVICE_TYPE'] == 'deerma.humidifier.jsq5' || $properties[$i]['DEVICE_TYPE'] == 'deerma.humidifier.jsq2g') {
+                    		//"target_humidity": {"siid": 2, "piid": 6},  # [30, 80] step 1
+                            if (($value >= 30) && ($value <= 80) && (($value % 10) == 0)) {
+								$this->addToQueue($properties[$i]['DEVICE_ID'], 'set_properties', '[{"did":"target-humidity","siid":2,"piid":6,"value":' . $value . '}]');
+                        	}
+						}
+				 
+                    } elseif ($properties[$i]['TITLE'] == 'target_temperature') {
+                        $value = (int)$value;
+                        if ($properties[$i]['DEVICE_TYPE'] == 'hfjh.fishbowl.v1') {
+                            // Установка температуры нагрева воды в аквариуме (от 18 до 32 градусов)
+                            if ($value < 18) $value = 18;
+                            if ($value > 32) $value = 32;
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_water_temp_value', '[' . $value . ']');
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'auto_feed') {
+                        $value = (int)$value;
+                        if ($properties[$i]['DEVICE_TYPE'] == 'hfjh.fishbowl.v1') {
+                            // Управление режимом подачи корма по расписанию
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_feed_switch', '[' . ($value ? 'true' : 'false') . ']');
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'single_feed') {
+                        $value = (int)$value;
+                        if ($properties[$i]['DEVICE_TYPE'] == 'hfjh.fishbowl.v1' && $value == 1) {
+                            // Одноразовая подача корма
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_single_feed', '[true]');
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'heater') {
+                        $value = (int)$value;
+                        if ($properties[$i]['DEVICE_TYPE'] == 'hfjh.fishbowl.v1') {
+                            // Управление подогревом воды
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_heater_switch', '[' . ($value ? 'true' : 'false') . ']');
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'pump') {
+                        $value = (int)$value;
+                        if ($properties[$i]['DEVICE_TYPE'] == 'hfjh.fishbowl.v1') {
+                            // Управление помпой
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_pump_switch', '[' . ($value ? 'true' : 'false') . ']');
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'water_flow') {
+                        $value = (int)$value;
+                        if ($properties[$i]['DEVICE_TYPE'] == 'hfjh.fishbowl.v1') {
+                            // Производительность помпы
+                            if ($value < 1) $value = 1;
+                            if ($value > 100) $value = 100;
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_pump_value', '[' . $value . ']');
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'status') {
+                        $value = (int)$value;
+                        if ($properties[$i]['DEVICE_TYPE'] == 'hfjh.fishbowl.v1') {
+                            // Состояние аквариума (включен/выключен)
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_Equipment_Status', '[' . ($value ? 'true' : 'false') . ']');
+                        }
+                    } elseif ($properties[$i]['TITLE'] == 'water_grade') {
+                        if ($properties[$i]['DEVICE_TYPE'] == 'dreame.vacuum.mc1808') {
+                            // Настройка расхода уровня воды (низкий/средний/высокий)
+                            switch ($value) {
+                                case 'Low':
+                                    $params = 1;
+                                    break;
+                                case 'Medium':
+                                    $params = 2;
+                                    break;
+                                case 'High':
+                                    $params = 3;
+                                    break;
+                                default:
+                                    $params = 1;
+                                    break;
+                            }
+                            $params = '[{"did":"water_grade","siid":18,"piid":20,"value":' . $value . '}]';
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_properties', $params);
+                        }
+                        if ($properties[$i]['DEVICE_TYPE'] == 'dreame.vacuum.p2140') {
+                            //todo: fix
+                            // Настройка расхода уровня воды (низкий/средний/высокий)
+                            switch ($value) {
+                                case 'Low':
+                                    $params = 1;
+                                    break;
+                                case 'Medium':
+                                    $params = 2;
+                                    break;
+                                case 'High':
+                                    $params = 3;
+                                    break;
+                                default:
+                                    $params = 1;
+                                    break;
+                            }
+                            $params = '[{"did":"water_grade","siid":18,"piid":20,"value":' . $value . '}]';
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_properties', $params);
+                        }
+                    }
+
+                    if ($properties[$i]['DEVICE_TYPE'] == 'hfjh.fishbowl.v1') {
+                        if ($properties[$i]['TITLE'] == 'led_brightness' || $properties[$i]['TITLE'] == 'led_color' || $properties[$i]['TITLE'] == 'led_flow_speed' || $properties[$i]['TITLE'] == 'led_flowing') {
+                            $flowing = SQLSelectOne("SELECT miio_commands.VALUE FROM miio_commands WHERE miio_commands.TITLE LIKE 'led_flowing' AND DEVICE_ID=" . $properties[$i]['DEVICE_ID'])['VALUE'];
+
+                            $bright = SQLSelectOne("SELECT miio_commands.VALUE FROM miio_commands WHERE miio_commands.TITLE LIKE 'led_brightness' AND DEVICE_ID=" . $properties[$i]['DEVICE_ID'])['VALUE'];
+
+                            $speed = SQLSelectOne("SELECT miio_commands.VALUE FROM miio_commands WHERE miio_commands.TITLE LIKE 'led_flow_speed' AND DEVICE_ID=" . $properties[$i]['DEVICE_ID'])['VALUE'];
+
+                            $color = SQLSelectOne("SELECT miio_commands.VALUE FROM miio_commands WHERE miio_commands.TITLE LIKE 'led_color' AND DEVICE_ID=" . $properties[$i]['DEVICE_ID'])['VALUE'];
+                            $color = hexdec(preg_replace('/^#/', '', $color));
+
+                            if ($flowing == 1) $mode = 2;
+                            else $mode = 1;
+
+                            if ($properties[$i]['TITLE'] == 'led_brightness') {
+                                $bright = (int)$value;
+                                if ($bright < 0) $bright = 0;
+                                if ($bright > 100) $bright = 100;
+                            } elseif ($properties[$i]['TITLE'] == 'led_color') {
+                                $value = preg_replace('/^#/', '', $value);
+                                $color = hexdec($value);
+                                if ($color < 0 && $color > 16777215) {
+                                    $color = 16777215;
+                                }
+                            } elseif ($properties[$i]['TITLE'] == 'led_flowing') {
+                                $value = (int)$value;
+                                if ($value == 1) $mode = 2;
+                                else $mode = 1;
+                            } elseif ($properties[$i]['TITLE'] == 'led_flow_speed') {
+                                $speed = (int)$value;
+                                if ($speed < 0) $speed = 0;
+                                if ($speed > 100) $speed = 100;
+                                $mode = 2;
+                            }
+
+                            if ($mode == 0 || $mode == 1) {
+                                $params = "[$mode,$color,100,$bright]";
+                            } else if ($mode == 2) {
+                                $params = "[$mode,120,$speed,$bright]";
+                            }
+
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_led_board', $params);
+                        }
+                    }
+
+                    if ($properties[$i]['DEVICE_TYPE'] == '090615.switch.xswitch03') {
+                        $value = (int)$value;
+                        switch ($properties[$i]['TITLE']) {
+                            case 'channel_1':
+                                $method = 'SetSwitch1';
+                                break;
+                            case 'channel_2':
+                                $method = 'SetSwitch2';
+                                break;
+                            case 'channel_3':
+                                $method = 'SetSwitch3';
+                                break;
+                            case 'switch_all':
+                                $method = 'SetSwitchAll';
+                                break;
+                            case 'backlight':
+                                $method = 'SetBlacklight';
+                                break;
+                        }
+                        if ($method == 'SetSwitchAll') {
+                            $params = "[$value,$value,$value]";
+                        } else {
+                            $params = "[$value]";
+                        }
+                        $this->addToQueue($properties[$i]['DEVICE_ID'], $method, $params);
+                    }
+
+                    if (($properties[$i]['DEVICE_TYPE'] == 'lumi.gateway.v3') || ($properties[$i]['DEVICE_TYPE'] == 'lumi.acpartner.v3')) {
+                        if ($properties[$i]['TITLE'] == 'current_volume') {
+                            // Изменение громкости
+                            $value = (int)$value;
+                            if ($value < 0) $value = 0;
+                            if ($value > 100) $value = 100;
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'volume_ctrl_fm', '["' . $value . '"]');
+                        } else if ($properties[$i]['TITLE'] == 'current_status') {
+                            // Команды управления проигрыванием (on, off, toggle, next, prev)
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'play_fm', '["' . $value . '"]');
+                        } else if ($properties[$i]['TITLE'] == 'add_program') {
+                            // Добавление новой радиостанции (по URL)
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'add_channels', '{"chs":[{"id":' . time() . ',"url":"' . $value . '","type":0}]}');
+                        } else if ($properties[$i]['TITLE'] == 'current_program') {
+                            // Проиграть конкретную (по ID) радиостанцию с текущей громкостью
+                            $volume = SQLSelectOne("SELECT VALUE FROM miio_commands WHERE DEVICE_ID='" . $properties[$i]['DEVICE_ID'] . "' AND TITLE='current_volume'")['VALUE'];
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'play_specify_fm', "[$value,$volume]");
+                        } else if ($properties[$i]['TITLE'] == 'del_program') {
+                            // Удалить радиостанцию (по ID)
+                            $all_chs = SQLSelectOne("SELECT VALUE FROM miio_commands WHERE DEVICE_ID='" . $properties[$i]['DEVICE_ID'] . "' AND TITLE='all_program'")['VALUE'];
+                            $all_chs = json_decode($all_chs, true);
+                            foreach ($all_chs['chs'] as $ch) {
+                                if ($ch['id'] == $value) {
+                                    $ch_url = $ch['url'];
+                                    break;
+                                }
+                            }
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'remove_channels', '{"chs":[{"id":' . $value . ',"url":"' . $ch_url . '","type":0}]}');
+                        } else if ($properties[$i]['TITLE'] == 'arming_mode') {
+                            // Управление режимом охраны
+                            if ($value) {
+                                $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_arming', '["on"]');
+                            } else {
+                                $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_arming', '["off"]');
+                            }
+                        }
+                    }
+
+                    if ($properties[$i]['DEVICE_TYPE'] == 'zhimi.heater.zb1a') {
+                        if ($properties[$i]['TITLE'] == 'on') {
+                            if ($value) {
+                                $value = 'true';
+                            } else {
+                                $value = 'false';
+                            }
+                            $params = '[{"did":"on","siid":2,"piid":2,"value":' . $value . '}]';
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_properties', $params);
+                        } elseif ($properties[$i]['TITLE'] == 'target-temperature') {
+                            $params = '[{"did":"target-temperature","siid":2,"piid":6,"value":' . (float)$value . '}]';
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_properties', $params);
+                        }
+                        //zhimi.heater.zb1a
+                    }
+					
+                    if ($properties[$i]['DEVICE_TYPE'] == 'zhimi.heater.mc2') {
+                        if ($properties[$i]['TITLE'] == 'power') {
+                            $params = '[{"did":"power","siid":2,"piid":1,"value":' . ($value ? 'true' : 'false') . '}]';
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_properties', $params);
+                        } elseif ($properties[$i]['TITLE'] == 'target_temperature') {
+                            if ($value < 18) $value = 18;
+                            if ($value > 28) $value = 28;
+                            $params = '[{"did":"target_temperature","siid":2,"piid":5,"value":' . $value . '}]';
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_properties', $params);
+                        } elseif ($properties[$i]['TITLE'] == 'buzzer') {
+                            $params = '[{"did":"buzzer","siid":6,"piid":1,"value":' . ($value ? 'true' : 'false') . '}]';
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_properties', $params);
+                        } elseif ($properties[$i]['TITLE'] == 'led') {
+                            $params = '[{"did":"led","siid":7,"piid":3,"value":' . ($value ? 'true' : 'false') . '}]';
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_properties', $params);
+                        } elseif ($properties[$i]['TITLE'] == 'child_lock') {
+                            $params = '[{"did":"child_lock","siid":5,"piid":1,"value":' . ($value ? 'true' : 'false') . '}]';
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_properties', $params);
+                        } elseif ($properties[$i]['TITLE'] == 'countdown_time') {
+                            if ($value < 0) $value = 0;
+                            if ($value > 12) $value = 12;
+                            $params = '[{"did":"countdown_time","siid":3,"piid":1,"value":' . $value . '}]';
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_properties', $params);
+                        }
+                        //zhimi.heater.mc2           
+		            }
+					
+                    if ($properties[$i]['DEVICE_TYPE'] == 'isa.camera.hlc7') {
+                        if ($properties[$i]['TITLE'] == 'on') {
+                            if ($value) {
+                                $value = 'true';
+                            } else {
+                                $value = 'false';
+                            }
+                            $params = '[{"did":"on","siid":2,"piid":1,"value":' . $value . '}]';
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_properties', $params);
+                        }
+                    }
+                    
+                    if ($properties[$i]['DEVICE_TYPE'] == 'mmgg.pet_waterer.s1') {
+                        if ($properties[$i]['TITLE'] == 'on') {
+                            if ($value) {
+                                $value = 'true';
+                            } else {
+                                $value = 'false';
+                            }
+                            $params = '[{"did":"on","siid":2,"piid":2,"value":' . $value . '}]';
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_properties', $params);
+                        }
+                        if ($properties[$i]['TITLE'] == 'led') {
+                            if ($value) {
+                                $value = 'true';
+                            } else {
+                                $value = 'false';
+                            }
+                            $params = '[{"did":"led","siid":4,"piid":1,"value":' . $value . '}]';
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_properties', $params);
+                        }
+                        if ($properties[$i]['TITLE'] == 'mode') {
+                            $params = '[{"mode":"mode","siid":2,"piid":3,"value":' . $value . '}]';
+                            $this->addToQueue($properties[$i]['DEVICE_ID'], 'set_properties', $params);
+                        }
+                        //mmgg.pet_waterer.s1
+                    }
+                    //
+
+                    SQLExec("UPDATE miio_commands SET VALUE='" . DBSafe($value) . "', UPDATED='" . date('Y-m-d H:i:s') . "' WHERE ID=" . $properties[$i]['ID']);
+                }
+            }
+        }
+    }
+    /**
+     * processCommand
+     *
+     * ...
+     *
+     * @access private
+     */
+
+    function processCommand($device_id, $command, $value, $params = 0)
+    {
+
+        $cmd_rec = SQLSelectOne("SELECT * FROM miio_commands WHERE DEVICE_ID=" . (int)$device_id . " AND TITLE LIKE '" . DBSafe($command) . "'");
+
+        if (!$cmd_rec['ID']) {
+            $cmd_rec = array();
+            $cmd_rec['TITLE'] = $command;
+            $cmd_rec['DEVICE_ID'] = $device_id;
+            $cmd_rec['ID'] = SQLInsert('miio_commands', $cmd_rec);
+        }
+
+        $old_value = $cmd_rec['VALUE'];
+
+        $cmd_rec['VALUE'] = $value;
+        $cmd_rec['UPDATED'] = date('Y-m-d H:i:s');
+        SQLUpdate('miio_commands', $cmd_rec);
+
+        // Если значение метрики не изменилось, то выходим.
+        if ($old_value == $value) return;
+
+        // Иначе обновляем привязанное свойство.
+        if ($cmd_rec['LINKED_OBJECT'] && $cmd_rec['LINKED_PROPERTY']) {
+            setGlobal($cmd_rec['LINKED_OBJECT'] . '.' . $cmd_rec['LINKED_PROPERTY'], $value, array($this->name => '0'));
+        }
+
+        // И вызываем привязанный метод.
+        if ($cmd_rec['LINKED_OBJECT'] && $cmd_rec['LINKED_METHOD']) {
+            if (!is_array($params)) {
+                $params = array();
+            }
+            $params['PROPERTY'] = $command;
+            $params['VALUE'] = $value;
+            $params['OLD_VALUE'] = $old_value;
+            $params['NEW_VALUE'] = $value;
+
+            callMethodSafe($cmd_rec['LINKED_OBJECT'] . '.' . $cmd_rec['LINKED_METHOD'], $params);
+        }
+
+    }
+
+    /**
+     * processMessage
+     *
+     * Обработка ответов от устройств
+     *
+     * @access private
+     */
+
+    function processMessage($message, $command, $device_id)
+    {
+
+        $this->getConfig();
+
+        if (!empty($this->config['API_LOG_DEBMES'])) DebMes("Incoming message from $device_id ($command): $message", 'xiaomimiio');
+
+        $res_commands = array();
+
+        if ($device_id) {
+            $device = SQLSelectOne("SELECT * FROM miio_devices WHERE ID=" . (int)$device_id);
+        }
+
+        $data = json_decode($message, true);
+
+        if (isset($data['error']) && $data['error'] == 'Device not answered') {
+            if ($device['ID']) {
+                $res_commands[] = array('command' => 'online', 'value' => 0);
+                $res_commands[] = array('command' => 'message', 'value' => $message);
+            }
+        } elseif ($command == 'discover_all') {
+            if (is_array($data['devices'])) {
+                foreach ($data['devices'] as $dev) {
+                    $dev = json_decode($dev, true);
+                    $device_type_code = $dev['devicetype'];
+                    $device_serial = $dev['serial'];
+                    $token = $dev['token'];
+
+                    if (preg_match('/^[0fF]+$/', $token)) {
+                        $token = '';
+                    }
+
+                    $dev_rec = SQLSelectOne("SELECT * FROM miio_devices WHERE DEVICE_TYPE_CODE='" . $device_type_code . "' AND SERIAL='" . $device_serial . "'");
+
+                    if ($dev_rec['ID']) {
+                        $dev_rec['IP'] = $dev['ip'];
+                        if ($token != '') {
+                            $dev_rec['TOKEN'] = $token;
+                        }
+                        SQLUpdate('miio_devices', $dev_rec);
+                    } else {
+                        $dev_rec = array();
+                        $dev_rec['IP'] = $dev['ip'];
+                        if ($token != '') {
+                            $dev_rec['TOKEN'] = $token;
+                        }
+                        $dev_rec['SERIAL'] = $device_serial;
+                        $dev_rec['DEVICE_TYPE_CODE'] = $device_type_code;
+                        $dev_rec['TITLE'] = 'New ' . $dev_rec['DEVICE_TYPE_CODE'];
+                        $dev_rec['ID'] = SQLInsert('miio_devices', $dev_rec);
+                    }
+                    $this->processCommand($dev_rec['ID'], 'online', 1);
+                }
+            }
+        } elseif ($device['ID']) {
+
+            $res_commands[] = array('command' => 'online', 'value' => 1);
+            $res_commands[] = array('command' => 'message', 'value' => $message);
+
+            if (is_array($data['result'])) {
+                $prop_count = count($data['result']);
+            } else {
+                $prop_count = 0;
+            }
+
+            if (($device['DEVICE_TYPE'] == 'lumi.gateway.v3') || ($device['DEVICE_TYPE'] == 'lumi.acpartner.v3')) {
+                if ($command == 'get_prop_fm' && is_array($data['result'])) {
+                    foreach ($data['result'] as $key => $value) {
+                        $res_commands[] = array('command' => $key, 'value' => $value);
+                    }
+                }
+                if ($command == 'get_channels' && is_array($data['result'])) {
+                    $res_commands[] = array('command' => 'all_program', 'value' => json_encode($data['result']));
+                }
+                if ($command == 'get_lumi_dpf_aes_key' && is_array($data['result'])) {
+                    $res_commands[] = array('command' => 'lumi_dpf_aes_key', 'value' => $data['result'][0]);
+                }
+                if ($command == 'get_zigbee_channel' && is_array($data['result'])) {
+                    $res_commands[] = array('command' => 'zigbee_channel', 'value' => $data['result'][0]);
+                }
+                if ($command == 'get_arming' && is_array($data['result'])) {
+                    if ($data['result'][0] != 'oning') {
+                        $res_commands[] = array('command' => 'arming_mode', 'value' => $data['result'][0]);
+                    }
+                }
+                if ($device['DEVICE_TYPE'] == 'lumi.acpartner.v3') {
+                    if ($command == 'get_device_prop' && is_array($data['result'])) {
+                        $res_commands[] = array('command' => 'power', 'value' => $data['result'][0]);
+                        $res_commands[] = array('command' => 'load_power', 'value' => $data['result'][1]);
+                    }
+                }
+            } elseif ($device['DEVICE_TYPE'] == 'yeelink.light.mono1' && $command == 'get_prop' && is_array($data['result'])) {
+                $props = explode(',', XiaomiMiioConst::MIIO_YEELIGHT_WHITE_BULB_PROPS);
+                $i = 0;
+                foreach ($props as $key) {
+                    $value = $data['result'][$i];
+                    if ($key == 'flow_params') $key = 'flow';
+                    $res_commands[] = array('command' => $key, 'value' => $value);
+                    $i++;
+                }
+            } elseif (($device['DEVICE_TYPE'] == 'philips.light.bulb') || ($device['DEVICE_TYPE'] == 'philips.light.downlight')) {
+                if ($command == 'get_prop' && is_array($data['result'])) {
+                    $props = explode(',', XiaomiMiioConst::MIIO_PHILIPS_LIGHT_BULB_PROPS);
+                    $i = 0;
+                    foreach ($props as $key) {
+                        $value = $data['result'][$i];
+                        $res_commands[] = array('command' => $key, 'value' => $value);
+                        $i++;
+                    }
+                }
+            } elseif ($device['DEVICE_TYPE'] == 'philips.light.candle' && $command == 'get_prop' && is_array($data['result'])) {
+                $props = explode(',', XiaomiMiioConst::MIIO_PHILIPS_LIGHT_CANDLE_PROPS);
+                $i = 0;
+                foreach ($props as $key) {
+                    $value = $data['result'][$i];
+                    $res_commands[] = array('command' => $key, 'value' => $value);
+                    $i++;
+                }
+            } elseif ($device['DEVICE_TYPE'] == 'philips.light.sread1' && $command == 'get_prop' && is_array($data['result'])) {
+                $props = explode(',', XiaomiMiioConst::MIIO_PHILIPS_EYECARE_LAMP_2_PROPS);
+                $i = 0;
+                foreach ($props as $key) {
+                    $value = $data['result'][$i];
+                    if ($key == 'scene_num') $key = 'snm';
+                    else if ($key == 'dvalue') $key = 'dv';
+                    else if ($key == 'bls') $key = 'bl';
+                    $res_commands[] = array('command' => $key, 'value' => $value);
+                    $i++;
+                }
+            } elseif ($device['DEVICE_TYPE'] == 'yeelink.light.color1' && $command == 'get_prop' && is_array($data['result'])) {
+                $props = explode(',', XiaomiMiioConst::MIIO_YEELIGHT_COLOR_BULB_PROPS);
+                $i = 0;
+                foreach ($props as $key) {
+                    $value = $data['result'][$i];
+                    if ($key == 'flow_params') $key = 'flow';
+                    if ($key == 'rgb') {
+                        $value = str_pad(dechex($value), 6, '0', STR_PAD_LEFT);
+                    }
+                    $res_commands[] = array('command' => $key, 'value' => $value);
+                    $i++;
+                }
+            } elseif (($device['DEVICE_TYPE'] == 'rockrobo.vacuum.v1') || ($device['DEVICE_TYPE'] == 'roborock.vacuum.s5') || ($device['DEVICE_TYPE'] == 'roborock.vacuum.m1s')) {
+                if (($command == 'get_status' || $command == 'get_consumable') && is_array($data['result'])) {
+                    foreach ($data['result'][0] as $key => $value) {
+                        $res_commands[] = array('command' => $key, 'value' => $value);
+                        if ($key == 'state') {
+                            $state_codes = XiaomiMiioConst::MIIO_MIVACUUM_1_STATE_CODES;
+                            if (array_key_exists($value, $state_codes)) $res_commands[] = array('command' => 'state_text', 'value' => $state_codes[$value]);
+                        } else if ($key == 'error_code') {
+                            $error_codes = XiaomiMiioConst::MIIO_MIVACUUM_1_ERROR_CODES;
+                            if (array_key_exists($value, $error_codes)) $res_commands[] = array('command' => 'error_text', 'value' => $error_codes[$value]);
+                        } else if ($key == 'main_brush_work_time') {
+                            $value = round(300 - $value / 3600);
+                            $res_commands[] = array('command' => 'main_brush_work_life', 'value' => ($value < 0) ? 0 : $value);
+                        } else if ($key == 'side_brush_work_time') {
+                            $value = round(200 - $value / 3600);
+                            $res_commands[] = array('command' => 'side_brush_work_life', 'value' => ($value < 0) ? 0 : $value);
+                        } else if ($key == 'filter_work_time') {
+                            $value = round(150 - $value / 3600);
+                            $res_commands[] = array('command' => 'filter_work_life', 'value' => ($value < 0) ? 0 : $value);
+                        } else if ($key == 'sensor_dirty_time') {
+                            $value = round(30 - $value / 3600);
+                            $res_commands[] = array('command' => 'sensor_dirty_life', 'value' => ($value < 0) ? 0 : $value);
+                        }
+                    }
+                } else if ($command == 'get_custom_mode' && is_array($data['result'])) {
+                    //get_custom_mode    {"result":[60],"id":1535013272}
+                    $res_commands[] = array('command' => 'custom_mode', 'value' => $data['result'][0]);
+                }
+            } elseif ($device['DEVICE_TYPE'] == 'chuangmi.plug.m1' && $command == 'get_prop' && is_array($data['result'])) {
+                $props = explode(',', XiaomiMiioConst::MIIO_CHUANGMI_PLUG_M1_PROPS);
+                $i = 0;
+                foreach ($props as $key) {
+                    $value = $data['result'][$i];
+                    $res_commands[] = array('command' => $key, 'value' => $value);
+                    $i++;
+                }
+            } elseif (($device['DEVICE_TYPE'] == 'chuangmi.plug.v1') || ($device['DEVICE_TYPE'] == 'chuangmi.plug.v3')) {
+                if ($command == 'get_prop' && is_array($data['result'])) {
+                    $props = explode(',', XiaomiMiioConst::MIIO_CHUANGMI_PLUG_V1_PROPS);
+                    $i = 0;
+                    foreach ($props as $key) {
+                        $value = $data['result'][$i];
+                        if ($key == 'usb_on') {
+                            if ($value == 'true') $value = 1;
+                            else if ($value == 'false') $value = 0;
+                        }
+                        $res_commands[] = array('command' => $key, 'value' => $value);
+                        $i++;
+                    }
+                } elseif ($command == 'get_power') {
+                    $key = 'load_power';
+                    $value = $data['result'][0];
+                    if ($value == '' || $value == 'null' || $value == null) $value = '0';
+                    $value = $value / 100;
+                    $res_commands[] = array('command' => $key, 'value' => $value);
+                }
+            } elseif ($device['DEVICE_TYPE'] == 'philips.light.ceiling' && $command == 'get_prop' && is_array($data['result'])) {
+                $props = explode(',', XiaomiMiioConst::MIIO_PHILIPS_LIGHT_CEILING_PROPS);
+                $i = 0;
+                foreach ($props as $key) {
+                    $value = $data['result'][$i];
+                    $res_commands[] = array('command' => $key, 'value' => $value);
+                    $i++;
+                }
+            } elseif (($device['DEVICE_TYPE'] == 'yeelink.light.ceiling1') || ($device['DEVICE_TYPE'] == 'yeelink.light.ceiling8') || ($device['DEVICE_TYPE'] == 'yeelink.light.ceiling3')) {
+                if ($command == 'get_prop' && is_array($data['result'])) {
+                    $props = explode(',', XiaomiMiioConst::MIIO_YEELIGHT_CEILING_LIGHT_PROPS);
+                    $i = 0;
+                    foreach ($props as $key) {
+                        $value = $data['result'][$i];
+                        if ($key == 'flow_params') $key = 'flow';
+                        if ($key == 'nl_br' && $value != 0) {
+                            $res_commands[3]['value'] = $value;    // свойство bright
+                            $res_commands[] = array('command' => $key, 'value' => 1);
+                        } else {
+                            $res_commands[] = array('command' => $key, 'value' => $value);
+                        }
+                        $i++;
+                    }
+                }
+            } elseif ($device['DEVICE_TYPE'] == 'yeelink.light.ceiling4' && $command == 'get_prop' && is_array($data['result'])) {
+                $props = explode(',', XiaomiMiioConst::MIIO_YEELIGHT_CEILING_LIGHT_650_PROPS);
+                $i = 0;
+                foreach ($props as $key) {
+                    $value = $data['result'][$i];
+                    if ($key == 'flow_params') $key = 'flow';
+                    if ($key == 'bg_flow_params') $key = 'bg_flow';
+                    if ($key == 'bg_rgb') {
+                        $value = str_pad(dechex($value), 6, '0', STR_PAD_LEFT);
+                    }
+                    if ($key == 'nl_br' && $value != 0) {
+                        $res_commands[3]['value'] = $value;    // свойство bright
+                        $res_commands[] = array('command' => $key, 'value' => 1);
+                    } else {
+                        $res_commands[] = array('command' => $key, 'value' => $value);
+                    }
+                    $i++;
+                }
+            } elseif (
+                ($device['DEVICE_TYPE'] == 'yeelink.light.lamp1' ||
+                    $device['DEVICE_TYPE'] == 'yeelink.light.lamp2' ||
+                    $device['DEVICE_TYPE'] == 'yeelink.light.lamp4')
+                && $command == 'get_prop' && is_array($data['result'])) {
+                $props = explode(',', XiaomiMiioConst::MIIO_YEELIGHT_LAMP_LIGHT_PROPS);
+                $i = 0;
+                foreach ($props as $key) {
+                    $value = $data['result'][$i];
+                    if ($key == 'flow_params') $key = 'flow';
+                    $res_commands[] = array('command' => $key, 'value' => $value);
+                    $i++;
+                }
+            } elseif ($device['DEVICE_TYPE'] == 'yeelink.light.strip1' && $command == 'get_prop' && is_array($data['result'])) {
+                $props = explode(',', XiaomiMiioConst::MIIO_YEELIGHT_STRIP_PROPS);
+                $i = 0;
+                foreach ($props as $key) {
+                    $value = $data['result'][$i];
+                    if ($key == 'flow_params') $key = 'flow';
+                    if ($key == 'rgb') {
+                        $value = str_pad(dechex($value), 6, '0', STR_PAD_LEFT);
+                    }
+                    $res_commands[] = array('command' => $key, 'value' => $value);
+                    $i++;
+                }
+            } elseif ($device['DEVICE_TYPE'] == 'zimi.powerstrip.v2' && $command == 'get_prop' && is_array($data['result'])) {
+                $props = explode(',', XiaomiMiioConst::MIIO_ZIMI_POWERSTRIP_2_PROPS);
+                $i = 0;
+                foreach ($props as $key) {
+                    $value = $data['result'][$i];
+                    if ($key == 'current' || $key == 'power_consume_rate') {
+                        if ($value == '' || $value == 'null' || $value == null) $value = '0';
+                    }
+                    if ($key == 'mode') {
+                        if ($value == 'null' || $value == null) $value = '';
+                    }
+                    $res_commands[] = array('command' => $key, 'value' => $value);
+                    $i++;
+                }
+            } elseif ($device['DEVICE_TYPE'] == 'qmi.powerstrip.v1' && $command == 'get_prop' && is_array($data['result'])) {
+                $props = explode(',', XiaomiMiioConst::MIIO_QMI_POWERSTRIP_1_PROPS);
+                $i = 0;
+                foreach ($props as $key) {
+                    $value = $data['result'][$i];
+                    if ($key == 'current') {
+                        if ($value == '' || $value == 'null' || $value == null) $value = '0';
+                        else $value = $value / 1000;
+                    } elseif ($key == 'voltage') {
+                        if ($value == '' || $value == 'null' || $value == null) $value = '0';
+                        else $value = $value / 100;
+                    }
+                    $res_commands[] = array('command' => $key, 'value' => $value);
+                    $i++;
+                }
+            } elseif (($device['DEVICE_TYPE'] == 'zhimi.humidifier.v1') || ($device['DEVICE_TYPE'] == 'zhimi.humidifier.ca1')) {
+                if ($command == 'get_prop' && is_array($data['result'])) {
+                    if ($device['DEVICE_TYPE'] == 'zhimi.humidifier.v1') {
+                        $props = explode(',', XiaomiMiioConst::MIIO_ZHIMI_HUMIDIFIER_PROPS);
+                    } elseif ($device['DEVICE_TYPE'] == 'zhimi.humidifier.ca1') {
+                        $props = explode(',', XiaomiMiioConst::MIIO_ZHIMI_HUMIDIFIER_2_PROPS);
+                    }
+                    $i = 0;
+                    foreach ($props as $key) {
+                        $value = $data['result'][$i];
+                        if ($key == 'temp_dec') {
+                            $value = $value / 10;
+                            $key = 'temperature';
+                        }
+                        if ($key == 'led_b') {
+                            switch ($value) {
+                                case 0:
+                                    $value = 'bright';
+                                    break;
+                                case 1:
+                                    $value = 'dim';
+                                    break;
+                                case 2:
+                                    $value = 'off';
+                                    break;
+                                default:
+                                    $value = 'unknown';
+                                    break;
+                            }
+                        }
+                        $res_commands[] = array('command' => $key, 'value' => $value);
+                        $i++;
+                    }
+                }
+            } elseif ($device['DEVICE_TYPE'] == 'zhimi.airpurifier.ma2' && $command == 'get_prop' && is_array($data['result'])) {
+                $props = explode(',', XiaomiMiioConst::MIIO_ZHIMI_AIRPURIFIER_MA2_PROPS);
+                $i = 0;
+                foreach ($props as $key) {
+                    $value = $data['result'][$i];
+                    if ($key == 'temp_dec') {
+                        $value = $value / 10;
+                        $key = 'temperature';
+                    }
+                    if ($key == 'bright') $key = 'illumination';
+                    $res_commands[] = array('command' => $key, 'value' => $value);
+                    $i++;
+                }
+            } elseif ($device['DEVICE_TYPE'] == 'zhimi.airpurifier.v3' && $command == 'get_prop' && is_array($data['result'])) {
+                $props = explode(',', XiaomiMiioConst::MIIO_ZHIMI_AIRPURIFIER_V3_PROPS);
+                $i = 0;
+                foreach ($props as $key) {
+                    $value = $data['result'][$i];
+                    if ($key == 'bright') $key = 'illumination';
+                    $res_commands[] = array('command' => $key, 'value' => $value);
+                    $i++;
+                }
+            } elseif ($device['DEVICE_TYPE'] == 'yeelink.light.bslamp1' && $command == 'get_prop' && is_array($data['result'])) {
+                $props = explode(',', XiaomiMiioConst::MIIO_YEELIGHT_BSLAMP1_PROPS);
+                $i = 0;
+                foreach ($props as $key) {
+                    $value = $data['result'][$i];
+                    if ($key == 'flow_params') $key = 'flow';
+                    if ($key == 'rgb') {
+                        $value = str_pad(dechex($value), 6, '0', STR_PAD_LEFT);
+                    }
+                    $res_commands[] = array('command' => $key, 'value' => $value);
+                    $i++;
+                }
+            } elseif ($device['DEVICE_TYPE'] == 'xiaomi.wifispeaker.v1' && $command == 'get_prop' && is_array($data['result'])) {
+                foreach (json_decode($data['result'][0], true) as $key => $value) {
+                    $res_commands[] = array('command' => $key, 'value' => $value);
+                }
+                $res_commands[] = array('command' => 'volume', 'value' => $data['result'][1]);
+                $res_commands[] = array('command' => 'rel_time', 'value' => $data['result'][2]);
+            } elseif ($device['DEVICE_TYPE'] == 'zhimi.fan.sa1' && $command == 'get_prop' && is_array($data['result'])) {
+                $props = explode(',', XiaomiMiioConst::MIIO_ZHIMI_FAN_SA1_PROPS);
+                $i = 0;
+                foreach ($props as $key) {
+                    $value = $data['result'][$i];
+                    $res_commands[] = array('command' => $key, 'value' => $value);
+                    $i++;
+                }
+            } elseif ($device['DEVICE_TYPE'] == 'cgllc.airmonitor.s1' && $command == 'get_prop' && is_array($data['result'])) {
+                foreach ($data['result'] as $key => $value) {
+                    $res_commands[] = array('command' => $key, 'value' => $value);
+                }
+            } elseif ($device['DEVICE_TYPE'] == 'zhimi.airpurifier.mb3' && $command == 'get_properties' && is_array($data['result'])) {
+                foreach ($data['result'] as $res) {
+                    $value = $res['value'];
+                    if ($value === true) $value = 1;
+                    else if ($value === false) $value = 0;
+                    if ($res['did'] == 'led_b') {
+                        switch ($value) {
+                            case 0:
+                                $value = 'bright';
+                                break;
+                            case 1:
+                                $value = 'dim';
+                                break;
+                            case 2:
+                                $value = 'off';
+                                break;
+                            default:
+                                $value = 'unknown';
+                                break;
+                        }
+                    } else if ($res['did'] == 'mode') {
+                        switch ($value) {
+                            case 0:
+                                $value = 'auto';
+                                break;
+                            case 1:
+                                $value = 'silent';
+                                break;
+                            case 2:
+                                $value = 'favorite';
+                                break;
+                            case 3:
+                                $value = 'fan';
+                                break;
+                        }
+                    }
+                    $res_commands[] = array('command' => $res['did'], 'value' => $value);
+                }
+            } elseif ($device['DEVICE_TYPE'] == 'zhimi.humidifier.ca4' && $command == 'get_properties' && is_array($data['result'])) {
+                foreach ($data['result'] as $res) {
+                    $value = $res['value'];
+                    if ($value === true) $value = 1;
+                    else if ($value === false) $value = 0;
+                    if ($res['did'] == 'led_b') {
+                        switch ($value) {
+                            case 0:
+                                $value = 'bright';
+                                break;
+                            case 1:
+                                $value = 'dim';
+                                break;
+                            case 2:
+                                $value = 'off';
+                                break;
+                            default:
+                                $value = 'unknown';
+                                break;
+                        }
+                    } else if ($res['did'] == 'mode') {
+                    // Изменение режима (auto, silent, medium, high)
+                        switch ($value) {
+                            case 0:
+                                $value = 'auto';
+                                break;
+                            case 1:
+                                $value = 'silent';
+                                break;
+                            case 2:
+                                $value = 'medium';
+                                break;
+                            case 3:
+                                $value = 'high';
+                                break;
+                        }
+                    }
+                    $res_commands[] = array('command' => $res['did'], 'value' => $value);
+                }
+            } elseif ($device['DEVICE_TYPE'] == 'viomi.vacuum.v7' && $command == 'get_prop' && is_array($data['result'])) {
+                $props = explode(',', XiaomiMiioConst::MIIO_VIOMIVACUUM_V7_PROPS);
+                $i = 0;
+                foreach ($props as $key) {
+                    $value = $data['result'][$i];
+                    if ($key == 'run_state') {
+                        $key = 'state_code';
+                        $state_codes = XiaomiMiioConst::MIIO_VIOMIVACUUM_V7_STATE_CODES;
+                        if (array_key_exists($value, $state_codes)) $res_commands[] = array('command' => 'state_text', 'value' => $state_codes[$value]);
+                        else $res_commands[] = array('command' => 'state_text', 'value' => 'Unknown');
+                    } else if ($key == 'err_state') {
+                        $key = 'error_code';
+                        $state_codes = XiaomiMiioConst::MIIO_VIOMIVACUUM_V7_ERROR_CODES;
+                        if (array_key_exists($value, $state_codes)) $res_commands[] = array('command' => 'error_text', 'value' => $state_codes[$value]);
+                        else $res_commands[] = array('command' => 'error_text', 'value' => 'Unknown');
+                    } else if ($key == 'mode') {
+                        switch ($value) {
+                            case 0:
+                                $value = 'Vacuum';
+                                break;
+                            case 1:
+                                $value = 'VacuumAndMop';
+                                break;
+                            case 2:
+                                $value = 'Mop';
+                                break;
+                        }
+                    } else if ($key == 'box_type') {
+                        switch ($value) {
+                            case 1:
+                                $value = 'Vacuum';
+                                break;
+                            case 2:
+                                $value = 'Water';
+                                break;
+                            case 3:
+                                $value = 'VacuumAndWater';
+                                break;
+                        }
+                    } else if ($key == 'suction_grade') {
+                        switch ($value) {
+                            case 0:
+                                $value = 'Silent';
+                                break;
+                            case 1:
+                                $value = 'Standard';
+                                break;
+                            case 2:
+                                $value = 'Medium';
+                                break;
+                            case 3:
+                                $value = 'Turbo';
+                                break;
+                        }
+                    } else if ($key == 'water_grade') {
+                        switch ($value) {
+                            case 11:
+                                $value = 'Low';
+                                break;
+                            case 12:
+                                $value = 'Medium';
+                                break;
+                            case 13:
+                                $value = 'High';
+                                break;
+                        }
+                    } else if ($key == 'battary_life') {
+                        $key = 'battery';
+                    } else if ($key == 's_time') {
+                        $key = 'clean_time';
+                    } else if ($key == 's_area') {
+                        $key = 'clean_area';
+                    }
+                    $res_commands[] = array('command' => $key, 'value' => $value);
+                    $i++;
+                }
+            } elseif ($device['DEVICE_TYPE'] == 'cgllc.airmonitor.b1' && $command == 'get_air_data' && is_array($data['result'])) {
+                foreach ($data['result'] as $key => $value) {
+                    if ($key !== 'temperature_unit' && $key !== 'tvoc_unit') {
+                        if ($key == 'co2e') {
+                            $key = 'co2';
+                        } else {
+                            $value = round($value, 2);
+                        }
+                        $res_commands[] = array('command' => $key, 'value' => $value);
+                    }
+                }
+            } elseif (($device['DEVICE_TYPE'] == 'yunmi.kettle.r1') || ($device['DEVICE_TYPE'] == 'yunmi.kettle.r2') || ($device['DEVICE_TYPE'] == 'yunmi.kettle.r3')) {
+                if ($command == 'get_prop' && is_array($data['result'])) {
+                    $props = explode(',', XiaomiMiioConst::MIIO_YUNMI_KETTLE_R1_PROPS);
+                    $i = 0;
+                    foreach ($props as $key) {
+                        $value = $data['result'][$i];
+                        $res_commands[] = array('command' => $key, 'value' => $value);
+                        $i++;
+                    }
+                }
+            } elseif (($device['DEVICE_TYPE'] == 'deerma.humidifier.mjjsq') || ($device['DEVICE_TYPE'] == 'deerma.humidifier.jsq') || ($device['DEVICE_TYPE'] == 'deerma.humidifier.jsq1')) {
+                if ($command == 'get_prop' && is_array($data['result']) && $prop_count > 1) {
+                    if ($device['DEVICE_TYPE'] == 'deerma.humidifier.mjjsq') {
+                        $props = explode(',', XiaomiMiioConst::MIIO_DEERMA_HUMIDIFIER_MJJSQ_PROPS);
+                    } else if (($device['DEVICE_TYPE'] == 'deerma.humidifier.jsq') || ($device['DEVICE_TYPE'] == 'deerma.humidifier.jsq1')) {
+                        $props = explode(',', XiaomiMiioConst::MIIO_DEERMA_HUMIDIFIER_JSQ_PROPS);
+                    }
+                    $i = 0;
+                    foreach ($props as $key) {
+                        $value = $data['result'][$i];
+                        switch ($key) {
+                            case 'OnOff_State':
+                                $key = 'power';
+                                break;
+                            case 'TemperatureValue':
+                                $key = 'temperature';
+                                break;
+                            case 'Humidity_Value':
+                                $key = 'humidity';
+                                break;
+                            case 'HumiSet_Value':
+                                $key = 'target_humidity';
+                                break;
+                            case 'Humidifier_Gear':
+                                $key = 'mode';
+                                break;
+                            case 'Led_State':
+                                $key = 'led';
+                                break;
+                            case 'TipSound_State':
+                                $key = 'buzzer';
+                                break;
+                            case 'waterstatus':
+                                $key = 'water_status';
+                                break;
+                            case 'watertankstatus':
+                                $key = 'water_tank_status';
+                                break;
+                        }
+                        if ($key == 'mode') {
+                            switch ($value) {
+                                case 1:
+                                    $value = 'low';
+                                    break;
+                                case 2:
+                                    $value = 'medium';
+                                    break;
+                                case 3:
+                                    $value = 'high';
+                                    break;
+                                case 4:
+                                    $value = 'humidity';
+                                    break;
+                            }
+                        }
+                        $res_commands[] = array('command' => $key, 'value' => $value);
+                        $i++;
+                    }
+                }
+            } elseif ($device['DEVICE_TYPE'] == 'hfjh.fishbowl.v1') {
+                if ($command == 'get_prop' && is_array($data['result'])) {
+                    $props = explode(',', XiaomiMiioConst::MIIO_HFJH_FISHBOWL_V1_PROPS);
+                    $i = 0;
+                    foreach ($props as $key) {
+                        $value = $data['result'][$i];
+                        $i++;
+                        if ($value === true) $value = 1;
+                        else if ($value === false) $value = 0;
+                        switch ($key) {
+                            case 'Equipment_Status':
+                                $key = 'status';
+                                break;
+                            case 'water_tds':
+                                $key = 'tds';
+                                break;
+                            case 'water_temp':
+                                $key = 'temperature';
+                                break;
+                            case 'water_temp_value':
+                                $key = 'target_temperature';
+                                break;
+                            case 'heater_switch':
+                                $key = 'heater';
+                                break;
+                            case 'pump_switch':
+                                $key = 'pump';
+                                break;
+                            case 'pump_value':
+                                $key = 'water_flow';
+                                break;
+                            case 'feed_switch':
+                                $key = 'auto_feed';
+                                break;
+                            case 'led_board_brightness':
+                                $key = 'led_brightness';
+                                break;
+                            case 'led_board_color':
+                                $key = 'led_color';
+                                break;
+                            case 'led_board_speed':
+                                $key = 'led_flow_speed';
+                                break;
+                        }
+                        if ($key == 'led_color') {
+                            $value = str_pad(dechex($value), 6, '0', STR_PAD_LEFT);
+                        } else if ($key == 'led_board_model') {
+                            if ($value == 2) $res_commands[] = array('command' => 'led_flowing', 'value' => 1);
+                            else $res_commands[] = array('command' => 'led_flowing', 'value' => 0);
+                            continue;
+                        }
+                        $res_commands[] = array('command' => $key, 'value' => $value);
+                    }
+                } else if ('get_key_switch' && is_array($data['result'])) {
+                    $value = ($data['result'][0]) ? 1 : 0;
+                    $res_commands[] = array('command' => 'child_lock', 'value' => $value);
+                }
+            } elseif ($device['DEVICE_TYPE'] == 'uvfive.s_lamp.slmap2' && $command == 'get_properties' && is_array($data['result'])) {
+                foreach ($data['result'] as $res) {
+                    $value = $res['value'];
+                    if ($value === true) $value = 1;
+                    else if ($value === false) $value = 0;
+                    if ($res['did'] == 'state_code') {
+                        switch ($value) {
+                            case 1:
+                                $state_text = 'off';
+                                break;
+                            case 3:
+                                $state_text = 'pause';
+                                break;
+                            case 4:
+                                $state_text = 'active';
+                                break;
+                        }
+                        $res_commands[] = array('command' => 'state_text', 'value' => $state_text);
+                    }
+                    $res_commands[] = array('command' => $res['did'], 'value' => $value);
+                }
+            } elseif ($device['DEVICE_TYPE'] == '090615.switch.xswitch03' && $command == 'get_prop' && is_array($data['result'])) {
+                $res_commands[] = array('command' => 'channel_1', 'value' => $data['result'][0]);
+                $res_commands[] = array('command' => 'channel_2', 'value' => $data['result'][1]);
+                $res_commands[] = array('command' => 'channel_3', 'value' => $data['result'][2]);
+                $res_commands[] = array('command' => 'backlight', 'value' => $data['result'][3]);
+            } elseif ($device['DEVICE_TYPE'] == 'dmaker.airfresh.a1' && $command == 'get_prop' && is_array($data['result'])) {
+                $props = explode(',', XiaomiMiioConst::MIIO_AIRFRESH_A1_PROPS);
+                $i = 0;
+                foreach ($props as $key) {
+                    $value = $data['result'][$i];
+                    $i++;
+                    if ($value === true) $value = 1;
+                    else if ($value === false) $value = 0;
+                    switch ($key) {
+                        case 'temperature_outside':
+                            $key = 'temperature';
+                            break;
+                        case 'sound':
+                            $key = 'buzzer';
+                            break;
+                        case 'display':
+                            $key = 'led';
+                            break;
+                    }
+                    $res_commands[] = array('command' => $key, 'value' => $value);
+                }
+            } elseif (($device['DEVICE_TYPE'] == 'dreame.vacuum.mc1808')
+                && $command == 'get_properties'
+                && is_array($data['result'])) {
+                foreach ($data['result'] as $res) {
+                    $value = $res['value'];
+                    if ($value === true) $value = 1;
+                    else if ($value === false) $value = 0;
+                    if ($res['did'] == 'state_code') {
+                        $state_codes = XiaomiMiioConst::MIIO_DREAMVACUUM_C1_STATE_CODES;
+                        if (array_key_exists($value, $state_codes)) $res_commands[] = array('command' => 'state_text', 'value' => $state_codes[$value]);
+                        else $res_commands[] = array('command' => 'state_text', 'value' => 'Unknown');
+                    }
+                    if ($res['did'] == 'mode') {
+                        switch ($value) {
+                            case 0:
+                                $value = 'Silent';
+                                break;
+                            case 1:
+                                $value = 'Standard';
+                                break;
+                            case 2:
+                                $value = 'Medium';
+                                break;
+                            case 2:
+                                $value = 'Turbo';
+                                break;
+                        }
+                    }
+                    if ($res['did'] == 'water_grade') {
+                        switch ($value) {
+                            case 1:
+                                $value = 'Low';
+                                break;
+                            case 2:
+                                $value = 'Medium';
+                                break;
+                            case 3:
+                                $value = 'High';
+                                break;
+                        }
+                    }
+                    $res_commands[] = array('command' => $res['did'], 'value' => $value);
+                }
+            } elseif (($device['DEVICE_TYPE'] == 'dreame.vacuum.p2140p')
+                && $command == 'get_properties'
+                && is_array($data['result'])) {
+                foreach ($data['result'] as $res) {
+                    $value = $res['value'];
+                    if ($value === true) $value = 1;
+                    else if ($value === false) $value = 0;
+                    if ($res['did'] == 'charging_state') {
+                        if ($value == 1) $value_text = 'Charging';
+                        elseif ($value == 2) $value_text = 'Not Charging';
+                        elseif ($value == 5) $value_text = 'Go Charging';
+                        else $value_text = 'Unknown';
+                        $res_commands[] = array('command' => 'charging_state_text', 'value' => $value_text);
+                    }
+                    if ($res['did'] == 'device_mode') {
+                        if ($value == 0) $value_text = 'Silent';
+                        elseif ($value == 1) $value_text = 'Basic';
+                        elseif ($value == 2) $value_text = 'Strong';
+                        elseif ($value == 3) $value_text = 'Full Speed';
+                        else $value_text = 'Unknown';
+                        $res_commands[] = array('command' => 'mode', 'value' => $value_text);
+                    }
+                    if ($res['did'] == 'device_status') {
+                        if ($value == 1) $value_text = 'Sweeping';
+                        elseif ($value == 2) $value_text = 'Idle';
+                        elseif ($value == 3) $value_text = 'Paused';
+                        elseif ($value == 4) $value_text = 'Error';
+                        elseif ($value == 5) $value_text = 'Go Charging';
+                        elseif ($value == 6) $value_text = 'Charging';
+                        elseif ($value == 7) $value_text = 'Mopping';
+                        else $value_text = 'Unknown';
+                        $res_commands[] = array('command' => 'device_status_text', 'value' => $value_text);
+                    }
+                    $res_commands[] = array('command' => $res['did'], 'value' => $value);
+                }
+            } elseif ($command == 'get_properties' && is_array($data['result'])) {
+                foreach ($data['result'] as $res) {
+                    $value = $res['value'];
+                    if ($value === true) $value = 1;
+                    else if ($value === false) $value = 0;
+                    $res_commands[] = array('command' => $res['did'], 'value' => $value);
+                }
+            }
+        }
+
+        foreach ($res_commands as $c) {
+            $cmd = $c['command'];
+            $val = $c['value'];
+            if ($val === 'on') {
+                $val = 1;
+            } else if ($val === 'off') {
+                if ($cmd !== 'led_b' && $cmd !== 'state_text' && $cmd !== 'mode') {
+                    $val = 0;
+                }
+            }
+            $this->processCommand($device['ID'], $cmd, $val);
+        }
+
+    }
+    /**
+     * DeleteLinkedProperties
+     *
+     * Удаление слинкованных свойств.
+     *
+     * @access public
+     */
+
+    function DeleteLinkedProperties($id)
+    {
+        $properties = SQLSelect("SELECT * FROM miio_commands WHERE DEVICE_ID='{$id}' AND LINKED_OBJECT != '' AND LINKED_PROPERTY != ''");
+
+        if (!empty($properties)) {
+            foreach ($properties as $prop) {
+                removeLinkedProperty($prop['LINKED_OBJECT'], $prop['LINKED_PROPERTY'], $this->name);
+            }
+        }
+    }
+}
+

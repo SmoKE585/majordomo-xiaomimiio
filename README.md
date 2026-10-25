@@ -1,68 +1,86 @@
-# Xiaomi miIO
+# Xiaomi miIO для MajorDoMo
 
-Модуль предназначен для интеграции **MajorDoMo** с Wi-Fi устройствами из экосистемы **Xiaomi Mihome**, взаимодействующих по протоколу **miIO**.
+Модуль для Wi-Fi устройств Xiaomi / Mijia / Aqara по локальному протоколу
+**miIO** (UDP 54321). Без облака Xiaomi и подписок: IP и токен устройства
+хранятся в MajorDoMo, обмен идёт напрямую.
 
-**miIO** - проприетарный сетевой протокол Xiaomi с шифрованием, по которому взаимодействуют wifi-устройства из экосистемы Xiaomi и приложение Mihome на смартфоне. В качестве транспорта используется UDP и порт 54321. Содержимое пакетов шифруется. Ключи шифрования формируются на основе уникальных токенов. Для контроля корректности принимаемых пакетов используется контрольная сумма на основе алгоритма MD5.
+Версия **4.0** — переписанный интерфейс и цикл поверх проверенного движка
+устройств из 3.2b. Таблицы и привязки сохраняются при обновлении.
 
-Использование этого протокола позволяет управлять теми устройствами, которые не имеют открытого API (режима разработчика). Например, пылесосы, лампы, светильники, увлажнители и очистители воздуха, розетки и многие другие. Также позволяет расширить имеющиеся возможности открытого API у xiaomi-шлюза, в частности переводить его в режим сопряжения, привязывать и отвязывать zigbee-устройства, управлять радио и др.
+## Возможности
 
-В основе модуля лежит библиотека **[php-miio](https://github.com/skysilver-lab/php-miio)**.
+- список устройств с поиском, статусом, моделью и быстрыми действиями;
+- карточка устройства: настройки, диагностика, свойства, справка;
+- свойства miIO и привязка к свойствам/методам объектов MajorDoMo;
+- опрос по расписанию с разбросом и backoff после ошибок;
+- очередь команд, очистка очереди, прямой запуск метода miIO;
+- шлюзы Aqara: радио, сопряжение и отвязка Zigbee, LAN-ключ;
+- ИК-обучение для `lumi.acpartner.v3` и `chuangmi.ir.v2`;
+- токены: безопасный импорт вывода `token_extractor.py` без передачи пароля;
+- чистые URL, тёмная тема, мобильная ширина, `MDJUI`-компоненты;
+- документация для «Базы знаний» MajorDoMo.
 
-Обсуждение модуля на **[Форуме](https://mjdm.ru/forum/viewtopic.php?f=5&t=4863)**.
+## Совместимость
 
-Модуль в **[Connect](https://connect.smartliving.ru/tasks/51.html)**.
+- MajorDoMo с новой админкой (`MDJUI`, `md-*`, чистые `/panel/...`), PHP 8.1+.
+- Устройства, которые поддерживал модуль 3.2b: Yeelight, Philips, Chuangmi,
+  Zhimi, Deerma, Roborock, Viomi, Dreame, Aqara, Mijia и другие. Полный список —
+  `modules/xiaomimiio/Catalog.php` и справки в `templates/xiaomimiio/help/ru/`.
+- Обновление с 3.x: данные не удаляются, колонки `FAILURES` и `LAST_SEEN`
+  добавляются автоматически.
 
-![miio](https://kb.mjdm.ru/wp-content/uploads/2018/07/module_miio.gif)
+## Установка
 
-### Поддерживаемые устройства
+1. Скопируйте содержимое репозитория в корень MajorDoMo, сохранив пути:
+   `modules/`, `templates/`, `public/assets/`, `scripts/`.
+2. Откройте `/panel/xiaomimiio.html`. Модуль зарегистрируется в
+   `project_modules`, создаст таблицы и запустит цикл.
+3. Проверьте цикл `cycle_xiaomimiio` в X-Ray.
+4. Добавьте устройство: IP, токен, при желании модель и период опроса.
 
-1. Шлюз ZigBee ***Mi Smart Home Gateway 2***
-2. Шлюз ZigBee ***Aqara AC Companion Gateway***
-3. Розетка ***Mi Smart Socket Plug 2***
-4. Розетка ***Mi Smart Socket Plug with USB***
-5. Розетка ***Mi Smart Socket Plug with 2 USB***
-6. Пылесос ***Mi Vacuum Cleaner***
-7. Пылесос ***Mi Roborock S50/S51***
-8. Пылесос ***Mi Robot Vacuum-Mop P***
-9. Настольная лампа ***Philips EyeCare Smart Desk Lamp 2***
-10. Лампочка белая Е27 ***Philips Light Bulb***
-11. Лампочка белая Е27 ***Yeelight White Bulb***
-12. Лампочка цветная Е27 ***Yeelight Color Bulb***
-13. Лампочки ***Philips Rui Chi Candle Light Bulb***
-14. Настольная лампа ***Mi LED Desk Lamp***
-15. Потолочный светильник ***Yeelight Ceiling Light***
-16. Потолочный светильник ***Yeelight Square Ceiling Light***
-17. Потолочный светильник ***Yeelight Jiaoyue 650 Ceiling Light***
-18. Потолочный светильник ***Yeelight Bright Moon LED Intelligent Ceiling***
-19. Потолочный светильник ***Philips EyeCare Smart Ceiling Lamp***
-20. Светодиодная лента ***Yeelight LED Lightstrip***
-21. Удлинитель (5 розеток) ***Mi (Chingmi) Smart Power Strip 5 Plugs***
-22. Удлинитель (6 розеток) ***Mi Smart Power Strip 6 Plugs***
-23. Увлажнитель воздуха ***Mi Air Humidifier***
-24. Увлажнитель воздуха ***Mi Air Humidifier 2***
-25. Увлажнитель воздуха ***Mi Air Humidifier MJJSQ***
-26. Очиститель воздуха ***Mi Air Purifier v3***
-27. Очиститель воздуха ***Mi Air Purifier 2S***
-28. Очиститель воздуха ***Mi Air Purifier 3/3H***
-29. Термопот ***Mi Heating Water Dispenser MINI (R1/R2)***
-30. Термопот ***Mi Heating Water Dispenser 4A (R3)***
-31. IR-контроллер ***Mi IR Remote 360***
-32. WiFi-колонка ***Mi Internet Speaker***
-33. Ночник ***Yeelight Bedside Lamp***
-34. Светильник (спот) ***Philips Zhirui Downlight***
-35. Напольный вентилятор ***Mi Smart Fan SA1***
-36. Анализатор качества воздуха ***Mi ClearGrass Air Monitor S1***
-37. Анализатор качества воздуха ***Mi ClearGrass Air Monitor B1***
-38. Ультрафиолетовая лампа ***Mi Five Disinfection Lamp***
-39. Трехканальный выключатель ***Mi PTX ThreeKey Switch***
-40. Аквариум ***Mi Smart Fish Tank***
+Обновление с 3.x — те же шаги: файлы заменяются, таблицы не пересоздаются.
+Подробности: [modules/xiaomimiio/docs/upgrade.md](modules/xiaomimiio/docs/upgrade.md).
 
-### Документация по модулю
-* [Общие сведения](https://kb.mjdm.ru/xiaomimiio_help/)
-* [Установка, обновление, удаление модуля](https://kb.mjdm.ru/xiaomimiio-ustanovka-obnovlenie/)
-* [Интерфейс модуля](https://kb.mjdm.ru/xiaomimiio-gui/)
-* [Настройка модуля](https://kb.mjdm.ru/xiaomimiio-settings/)
-* [Протокол miIO](https://kb.mjdm.ru/xiaomimiio-protocol/)
-* [Токены устройств](https://kb.mjdm.ru/xiaomimiio-tokens/)
-* [Управление техникой по ИК-каналу](https://kb.mjdm.ru/xiaomi-miio-ir-control/)
-* [Управление роботом-пылесосом](https://kb.mjdm.ru/miio-vacuums-control/)
+## Токены
+
+Токен — 32 шестнадцатеричных символа. Получается скриптом
+`token_extractor.py` на вашем компьютере; пароль Xiaomi на сервер не
+передаётся. Вывод скрипта импортируется на странице «Токены».
+
+Подробно: [modules/xiaomimiio/docs/tokens.md](modules/xiaomimiio/docs/tokens.md).
+
+## Структура
+
+```
+modules/xiaomimiio/
+  xiaomimiio.class.php   контроллер: страницы, действия, цикл
+  Engine.php             trait с движком miIO (опрос, очередь, разбор ответов)
+  Constants.php          справочники свойств и кодов состояний
+  Catalog.php            названия моделей, подписи и единицы свойств
+  Repository.php         доступ к таблицам модуля через Core::database()
+  lib/                   протокол miIO (miio.class.php, mipacket.class.php)
+  docs/                  документация для «Базы знаний»
+templates/xiaomimiio/    PHP-шаблоны (MDJUI) и справки по моделям
+public/assets/modules/xiaomimiio/  CSS, JS, изображения, token_extractor.py
+public/assets/img/modules/xiaomimiio.png  иконка модуля
+scripts/cycle_xiaomimiio.php       тонкий запускатор цикла
+```
+
+## Документация
+
+- [Обзор модуля](modules/xiaomimiio/docs/overview.md)
+- [Устройства и опрос](modules/xiaomimiio/docs/devices.md)
+- [Свойства и привязки](modules/xiaomimiio/docs/bindings.md)
+- [Шлюзы Aqara](modules/xiaomimiio/docs/gateways.md)
+- [Токены](modules/xiaomimiio/docs/tokens.md)
+- [Что берём из Home Assistant](modules/xiaomimiio/docs/roadmap.md)
+- [Обновление с 3.x](modules/xiaomimiio/docs/upgrade.md)
+
+## Благодарности
+
+Движок устройств и протокол miIO — Agaphonov Dmitri (skysilver) и участники
+модуля 3.2b, библиотека [php-miio](https://github.com/skysilver-lab/php-miio).
+Сравнение с Home Assistant — по интеграциям
+[`xiaomi_miio`](https://www.home-assistant.io/integrations/xiaomi_miio/),
+[`XiaoMi/ha_xiaomi_home`](https://github.com/XiaoMi/ha_xiaomi_home),
+[`al-one/hass-xiaomi-miot`](https://github.com/al-one/hass-xiaomi-miot).

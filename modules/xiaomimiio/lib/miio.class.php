@@ -16,7 +16,9 @@
 *	Copyright (C) 2017-2019 Agaphonov Dmitri aka skysilver <skysilver.da@gmail.com>
 */
 
-require('mipacket.class.php');
+// 2026-10-25 — путь к пакету считается от файла, а не от текущего каталога процесса:
+// цикл запускается из корня проекта и раньше не находил mipacket.class.php.
+require_once __DIR__ . '/mipacket.class.php';
 
 const	MIIO_PORT = '54321';
 

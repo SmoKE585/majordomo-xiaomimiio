@@ -1,0 +1,72 @@
+/* Xiaomi miIO — стили страницы модуля. Только свои классы, токены темы. */
+
+.md-xiaomi-page .md-xiaomi-inline-form { display: inline-flex; margin: 0; }
+.md-xiaomi-page .md-xiaomi-two-col { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr)); gap: var(--md-ui-space-16, 16px); align-items: start; }
+.md-xiaomi-page .md-kpi__value { overflow-wrap: anywhere; white-space: normal; }
+.md-xiaomi-page .md-card { min-width: 0; }
+
+.md-xiaomi-cell { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
+.md-xiaomi-value { max-width: 420px; overflow-wrap: anywhere; font-family: var(--bs-font-monospace, monospace); }
+.md-xiaomi-context { color: var(--md-ui-muted); overflow-wrap: anywhere; }
+
+.md-xiaomi-device-head { display: flex; gap: var(--md-ui-space-16, 16px); align-items: center; margin-bottom: var(--md-ui-space-16, 16px); }
+.md-xiaomi-device-meta { min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+.md-xiaomi-device-title { font-size: 1.15rem; font-weight: 600; overflow-wrap: anywhere; }
+.md-xiaomi-device-model { color: var(--md-ui-muted); overflow-wrap: anywhere; }
+
+.md-xiaomi-page .md-table__icon.md-xiaomi-image { display: grid; flex: 0 0 44px; width: 44px; height: 44px; overflow: hidden; }
+.md-xiaomi-image > img, .md-xiaomi-image > .ti { grid-area: 1 / 1; }
+.md-xiaomi-image > img { width: 100%; height: 100%; object-fit: contain; opacity: 0; }
+.md-xiaomi-image--loaded > img { opacity: 1; }
+.md-xiaomi-image--loaded > .ti { visibility: hidden; }
+.md-xiaomi-page .md-table__icon.md-xiaomi-image--large { flex-basis: 96px; width: 96px; height: 96px; font-size: 2rem; }
+
+.md-xiaomi-meta-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr)); gap: 10px 18px; margin: 0; }
+.md-xiaomi-meta-list > div { min-width: 0; }
+.md-xiaomi-meta-list dt { color: var(--md-ui-muted); font-size: .78rem; font-weight: 500; }
+.md-xiaomi-meta-list dd { margin: 2px 0 0; overflow-wrap: anywhere; }
+
+.md-xiaomi-tools { display: grid; gap: var(--md-ui-space-16, 16px); }
+.md-xiaomi-tool-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--md-ui-space-8, 8px); }
+.md-xiaomi-details { border-top: 1px solid var(--md-ui-border); padding-top: var(--md-ui-space-12, 12px); }
+.md-xiaomi-details summary { cursor: pointer; color: var(--md-ui-muted); margin-bottom: var(--md-ui-space-8, 8px); }
+
+.md-xiaomi-lan, .md-xiaomi-ir { display: grid; gap: var(--md-ui-space-8, 8px); border-top: 1px solid var(--md-ui-border); padding-top: var(--md-ui-space-12, 12px); }
+.md-xiaomi-log { margin: 0; min-height: 1.2em; color: var(--md-ui-muted); font-size: .85rem; overflow-wrap: anywhere; }
+.md-xiaomi-log:empty { display: none; }
+
+.md-xiaomi-json { margin: 0; padding: var(--md-ui-space-12, 12px); max-height: 360px; overflow: auto; background: var(--md-ui-surface-sunken, rgba(0, 0, 0, .04)); border-radius: var(--md-ui-radius-md, 10px); font-size: .82rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.md-xiaomi-result .md-card__body { display: grid; gap: var(--md-ui-space-8, 8px); }
+
+.md-xiaomi-divider { border: 0; border-top: 1px solid var(--md-ui-border); margin: var(--md-ui-space-16, 16px) 0; }
+.md-xiaomi-danger-zone { display: flex; flex-wrap: wrap; align-items: center; gap: var(--md-ui-space-8, 8px); border-top: 1px solid var(--md-ui-border); margin-top: var(--md-ui-space-16, 16px); padding-top: var(--md-ui-space-12, 12px); }
+
+.md-xiaomi-state-grid { display: flex; flex-wrap: wrap; align-items: center; gap: var(--md-ui-space-12, 12px); margin-bottom: var(--md-ui-space-12, 12px); }
+.md-xiaomi-page .md-xiaomi-kpi-tight { margin-top: 0; }
+.md-xiaomi-notes { margin-top: var(--md-ui-space-8, 8px); }
+
+.md-xiaomi-page .md-tabs { overflow-x: auto; flex-wrap: nowrap; }
+.md-xiaomi-page .md-tabs__count { color: var(--md-ui-muted); font-variant-numeric: tabular-nums; }
+.md-xiaomi-page .md-table--compact td, .md-xiaomi-page .md-table--compact th { padding-top: 6px; padding-bottom: 6px; }
+
+/* Старые справки написаны разметкой Bootstrap 3: приводим её к токенам темы. */
+.md-xiaomi-help { max-width: 100%; overflow-wrap: anywhere; }
+.md-xiaomi-help table { max-width: 100%; border-collapse: collapse; margin-bottom: var(--md-ui-space-12, 12px); }
+.md-xiaomi-help td, .md-xiaomi-help th { padding: 6px 8px; border-bottom: 1px solid var(--md-ui-border); vertical-align: top; }
+.md-xiaomi-help div[style*="width"] { width: auto !important; max-width: 100% !important; }
+.md-xiaomi-help .panel { border: 1px solid var(--md-ui-border); border-radius: var(--md-ui-radius-md, 10px); margin-bottom: var(--md-ui-space-8, 8px); background: var(--md-ui-surface, transparent); }
+.md-xiaomi-help .panel-heading { padding: 8px 12px; border-bottom: 1px solid var(--md-ui-border); font-weight: 600; }
+.md-xiaomi-help .panel-heading a { text-decoration: none; }
+.md-xiaomi-help .panel-body { padding: 10px 12px; }
+.md-xiaomi-help .table > thead > tr > th { border-bottom: 2px solid var(--md-ui-border); }
+.md-xiaomi-help .badge { display: inline-block; padding: 2px 7px; border-radius: 999px; background: var(--md-ui-surface-sunken, rgba(0, 0, 0, .08)); color: inherit; }
+.md-xiaomi-help img { max-width: 100%; height: auto; }
+.md-xiaomi-help .collapse:not(.show) { display: none; }
+
+@media (max-width: 576px) {
+    .md-xiaomi-device-head { flex-direction: column; align-items: flex-start; }
+    .md-xiaomi-page .md-ui-hero__actions { flex-wrap: wrap; }
+    .md-xiaomi-page .md-table__actions { flex-wrap: wrap; }
+    .md-xiaomi-page .md-btn { min-height: 44px; }
+    .md-xiaomi-page .md-btn--sm { min-height: 40px; }
+}
